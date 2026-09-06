@@ -15,16 +15,26 @@ without deleting its app data.
 #>
 param(
     [ValidatePattern('^[0-9A-Za-z][0-9A-Za-z.-]*$')]
-    [string]$ArtifactVersion = '1.0.0',
+    [string]$ArtifactVersion,
+    [switch]$IncludeAndroidTest,
+    [switch]$OnlyAndroidTest,
     [string]$ReleaseKeyStore = (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.android\OhMyNotification-release.jks'),
     [string]$ReleaseKeyAlias = 'ohmynotification-release',
     [string]$LineagePath = (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.android\OhMyNotification-signing-lineage')
 )
 
 $ErrorActionPreference = 'Stop'
+if ($OnlyAndroidTest) { $IncludeAndroidTest = $true }
 Set-StrictMode -Version Latest
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$versionConfig = Get-Content -LiteralPath (Join-Path $projectRoot 'app\build.gradle.kts') -Raw -Encoding UTF8
+$versionMatch = [regex]::Match($versionConfig, 'versionName\s*=\s*"([^"]+)"')
+if (-not $versionMatch.Success) { throw 'Could not read the current versionName.' }
+if ([string]::IsNullOrWhiteSpace($ArtifactVersion)) { $ArtifactVersion = $versionMatch.Groups[1].Value }
+if (-not $OnlyAndroidTest -and $ArtifactVersion -ne $versionMatch.Groups[1].Value) {
+    throw 'ArtifactVersion must match the application versionName.'
+}
 $unsignedApk = Join-Path $projectRoot 'app\build\outputs\apk\release\app-release-unsigned.apk'
 $artifactsDirectory = Join-Path $projectRoot 'artifacts'
 $signedApk = Join-Path $artifactsDirectory "OhMyNotification-$ArtifactVersion-release.apk"
@@ -36,8 +46,14 @@ foreach ($requiredFile in @($unsignedApk, $ReleaseKeyStore, $debugKeyStore)) {
         throw "Required file is missing: $requiredFile"
     }
 }
-if ((Test-Path -LiteralPath $signedApk) -or (Test-Path -LiteralPath $shaFile)) {
+if (-not $OnlyAndroidTest -and ((Test-Path -LiteralPath $signedApk) -or (Test-Path -LiteralPath $shaFile))) {
     throw "The $ArtifactVersion signed artifact already exists. Refusing to overwrite it."
+}
+if ($IncludeAndroidTest) {
+    $testInput = Join-Path $projectRoot 'app\build\outputs\apk\androidTest\debug\app-debug-androidTest.apk'
+    $testOutput = Join-Path $artifactsDirectory "OhMyNotification-$ArtifactVersion-androidTest.apk"
+    if (-not (Test-Path -LiteralPath $testInput)) { throw 'Build the AndroidTest APK before signing.' }
+    if (Test-Path -LiteralPath $testOutput) { throw 'The signed AndroidTest APK already exists.' }
 }
 
 function Resolve-SdkPath {
@@ -90,6 +106,7 @@ try {
     }
 
     New-Item -ItemType Directory -Path $artifactsDirectory -Force | Out-Null
+    if (-not $OnlyAndroidTest) {
     & $apksigner sign `
         --ks $debugKeyStore `
         --ks-key-alias androiddebugkey `
@@ -129,6 +146,16 @@ try {
     $sha256 = ([BitConverter]::ToString($shaBytes)).Replace('-', '').ToLowerInvariant()
     [IO.File]::WriteAllText($shaFile, "$sha256  $(Split-Path -Leaf $signedApk)`n", [Text.UTF8Encoding]::new($false))
     Write-Output "PASS apk=$signedApk sha256=$sha256 lineage=$LineagePath"
+    }
+    if ($IncludeAndroidTest) {
+        & $apksigner sign --ks $ReleaseKeyStore --ks-key-alias $ReleaseKeyAlias `
+            --ks-pass env:OMN_RELEASE_KEYSTORE_PASSWORD --key-pass env:OMN_RELEASE_KEYSTORE_PASSWORD `
+            --v4-signing-enabled false --out $testOutput $testInput
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to sign the AndroidTest APK.' }
+        & $apksigner verify --verbose --min-sdk-version 36 $testOutput
+        if ($LASTEXITCODE -ne 0) { throw 'AndroidTest signature verification failed.' }
+        Write-Output "PASS androidTest=$testOutput"
+    }
 }
 finally {
     [Environment]::SetEnvironmentVariable('OMN_RELEASE_KEYSTORE_PASSWORD', $null, 'Process')

@@ -10,10 +10,12 @@
     </queries>
 
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!--
       AndroidX Core declares this signature permission for pre-Android 13 receiver compatibility.
-      OMN requires Android 16 and does not register application broadcast receivers, so retaining it
+      OMN requires Android 16; its runtime receivers use platform export flags, so retaining it
       would unnecessarily couple Debug-to-Release certificate rotation to a public Debug key.
     -->
     <permission
@@ -42,6 +44,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/update_paths" />
+        </provider>
 
         <service
             android:name=".capture.OmnNotificationListenerService"

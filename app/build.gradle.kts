@@ -24,8 +24,8 @@ android {
         targetSdk = 36
         testApplicationId = "io.github.prince_dulb.ohmynotification.test"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 13
-        versionName = "1.0.1"
+        versionCode = 14
+        versionName = "1.1.0-rc1"
     }
 
     buildTypes {
@@ -51,6 +51,7 @@ android {
     sourceSets {
         getByName("test").resources.directories += rootProject.file("testdata").absolutePath
         getByName("androidTest").assets.directories += rootProject.file("testdata").absolutePath
+        getByName("androidTest").assets.directories += file("schemas").absolutePath
     }
 
     packaging {

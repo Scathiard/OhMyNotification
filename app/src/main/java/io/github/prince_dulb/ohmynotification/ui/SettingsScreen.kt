@@ -38,6 +38,8 @@ internal fun SettingsScreen(
     unavailableArchiveCount: Long,
     onOpenUnavailableArchive: () -> Unit,
     onManageExcludedApps: () -> Unit,
+    onOpenOnboarding: () -> Unit,
+    updateContent: @Composable () -> Unit,
     onSetNotificationTypeRecorded: suspend (NotificationType, Boolean) -> Boolean,
     onSetGroupingWindowMinutes: suspend (Int) -> Boolean,
     modifier: Modifier = Modifier,
@@ -59,6 +61,13 @@ internal fun SettingsScreen(
                     )
                 }
             }
+
+            item(key = "onboarding") {
+                OutlinedButton(onClick = onOpenOnboarding, modifier = Modifier.fillMaxWidth()) {
+                    Text("权限与后台运行 / 重新查看引导")
+                }
+            }
+            item(key = "updates") { updateContent() }
 
             item(key = "notification-types") {
                 SettingsCard(
@@ -85,8 +94,8 @@ internal fun SettingsScreen(
 
             item(key = "unavailable-archive") {
                 SettingsCard(
-                    title = "当前无跳转动作归档",
-                    supportingText = "记录仍保存在本机。点按其中一条时，OMN 会重扫一次系统当前仍存在的通知；若找回同一条的动作就尝试打开，但不保证成功。",
+                    title = "已归档通知",
+                    supportingText = "手动归档和当前没有跳转动作的记录都在这里。手动归档可以恢复；永久删除只能在这里执行。",
                 ) {
                     OutlinedButton(
                         onClick = onOpenUnavailableArchive,

@@ -43,6 +43,11 @@ class RuntimeActionStore(private val maxHandles: Int = 512) {
     }
 
     @Synchronized
+    fun removeAll(itemIds: Collection<Long>) {
+        if (handles.keys.removeAll(itemIds.toSet())) publishItemIds()
+    }
+
+    @Synchronized
     fun sendFromVisibleActivity(itemId: Long): RuntimeActionStatus {
         val action = handles[itemId] ?: return RuntimeActionStatus.NOT_FOUND
         val options = ActivityOptions.makeBasic().apply {

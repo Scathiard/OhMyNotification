@@ -21,8 +21,35 @@ interface OmnDao {
     )
     fun pageAllItems(): PagingSource<Int, NotificationItemEntity>
 
-    @RawQuery(observedEntities = [NotificationItemEntity::class])
+    @RawQuery(observedEntities = [NotificationItemEntity::class, ManualArchiveEntity::class])
     fun pageItemsFromSources(query: SupportSQLiteQuery): PagingSource<Int, NotificationItemEntity>
+
+    @RawQuery
+    suspend fun selectionSnapshot(query: SupportSQLiteQuery): List<NotificationSelectionRow>
+
+    @RawQuery(observedEntities = [NotificationItemEntity::class, ManualArchiveEntity::class])
+    fun observeMatchingCount(query: SupportSQLiteQuery): Flow<Long>
+
+    @Query("SELECT itemId FROM manual_archives WHERE itemId IN (:ids)")
+    fun observeManualArchiveIds(ids: List<Long>): Flow<List<Long>>
+
+    @Query("SELECT * FROM manual_archives WHERE itemId IN (:ids)")
+    suspend fun manualArchives(ids: List<Long>): List<ManualArchiveEntity>
+
+    @Query("SELECT itemId FROM notification_items WHERE itemId IN (:ids)")
+    suspend fun existingItemIds(ids: List<Long>): List<Long>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertManualArchives(entries: List<ManualArchiveEntity>)
+
+    @Query("DELETE FROM manual_archives WHERE itemId IN (:ids)")
+    suspend fun removeManualArchives(ids: List<Long>): Int
+
+    @Query("DELETE FROM manual_archives WHERE itemId = :id AND archivedAtEpochMillis = :timestamp")
+    suspend fun undoManualArchive(id: Long, timestamp: Long)
+
+    @Query("DELETE FROM notification_items WHERE itemId IN (:ids)")
+    suspend fun deleteItems(ids: List<Long>): Int
 
     @Query(
         """
@@ -84,20 +111,6 @@ interface OmnDao {
     @Query("SELECT COUNT(*) FROM notification_items")
     fun observeItemCount(): Flow<Long>
 
-    @Query(
-        """
-        SELECT * FROM health_evidence
-        WHERE occurredAtEpochMillis >= :startEpochMillis
-           OR evidenceId IN (
-               SELECT evidenceId FROM health_evidence
-               WHERE occurredAtEpochMillis < :startEpochMillis
-               ORDER BY occurredAtEpochMillis DESC, evidenceId DESC
-               LIMIT 32
-           )
-        ORDER BY occurredAtEpochMillis ASC, evidenceId ASC
-        """,
-    )
-    fun observeHealthEvidenceSince(startEpochMillis: Long): Flow<List<HealthEvidenceEntity>>
 
     @Query("SELECT COUNT(*) FROM notification_items")
     suspend fun itemCount(): Long

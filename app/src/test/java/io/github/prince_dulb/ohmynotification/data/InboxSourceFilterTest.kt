@@ -33,7 +33,7 @@ class InboxSourceFilterTest {
         query.bindTo(bindings)
 
         assertEquals(
-            "SELECT * FROM notification_items WHERE itemId IN (3,9) AND (" +
+            "SELECT * FROM notification_items WHERE (itemId IN (3,9) AND NOT itemId IN (SELECT itemId FROM manual_archives)) AND (" +
                 "(sourcePackage = ? AND sourceUserRef = ?) OR " +
                 "(sourcePackage = ? AND sourceUserRef = ?) OR " +
                 "(sourcePackage = ? AND sourceUserRef = ?)) " +
@@ -56,7 +56,7 @@ class InboxSourceFilterTest {
     @Test
     fun emptyRuntimeSetCreatesEmptyInboxAndFullArchive() {
         assertEquals(
-            "SELECT * FROM notification_items WHERE 0 ORDER BY sortTimeEpochMillis DESC, itemId DESC",
+            "SELECT * FROM notification_items WHERE (0 AND NOT itemId IN (SELECT itemId FROM manual_archives)) ORDER BY sortTimeEpochMillis DESC, itemId DESC",
             buildPageItemsQuery(
                 viewFilter = InboxViewFilter(),
                 actionView = NotificationActionView.ACTIONABLE,
@@ -64,7 +64,7 @@ class InboxSourceFilterTest {
             ).sql,
         )
         assertEquals(
-            "SELECT * FROM notification_items WHERE 1 ORDER BY sortTimeEpochMillis DESC, itemId DESC",
+            "SELECT * FROM notification_items WHERE (1 OR itemId IN (SELECT itemId FROM manual_archives)) ORDER BY sortTimeEpochMillis DESC, itemId DESC",
             buildPageItemsQuery(
                 viewFilter = InboxViewFilter(),
                 actionView = NotificationActionView.UNAVAILABLE_ARCHIVE,
@@ -87,7 +87,7 @@ class InboxSourceFilterTest {
         query.bindTo(bindings)
 
         assertEquals(
-            "SELECT * FROM notification_items WHERE itemId NOT IN (7,12) AND " +
+            "SELECT * FROM notification_items WHERE (itemId NOT IN (7,12) OR itemId IN (SELECT itemId FROM manual_archives)) AND " +
                 "((sourcePackage = ? AND sourceUserRef = ?)) " +
                 "ORDER BY sortTimeEpochMillis DESC, itemId DESC",
             query.sql,
@@ -109,7 +109,7 @@ class InboxSourceFilterTest {
         query.bindTo(bindings)
 
         assertEquals(
-            "SELECT * FROM notification_items WHERE 1 AND NOT " +
+            "SELECT * FROM notification_items WHERE (1 OR itemId IN (SELECT itemId FROM manual_archives)) AND NOT " +
                 "((sourcePackage = ? AND sourceUserRef = ?)) " +
                 "ORDER BY sortTimeEpochMillis DESC, itemId DESC",
             query.sql,

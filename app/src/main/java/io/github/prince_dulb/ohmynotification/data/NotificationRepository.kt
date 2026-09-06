@@ -39,19 +39,77 @@ class NotificationRepository(
     private val policyStore: MonitoringPolicyStore,
 ) {
     private val dao = database.omnDao()
-    private val positiveHealthEvidenceGate = PositiveHealthEvidenceGate()
 
     val sourceSummaries: Flow<List<SourceSummaryRow>> = dao.observeSourceSummaries()
     val excludedSources: Flow<List<ExcludedSourceEntity>> = dao.observeExcludedSources()
     val itemCount: Flow<Long> = dao.observeItemCount()
     val runtimeActionItemIds = runtimeActionStore.itemIds
+    fun manualArchiveIds(ids: List<Long>) = dao.observeManualArchiveIds(ids)
+
+    fun archiveCount(actionIds: Set<Long>): Flow<Long> = dao.observeMatchingCount(
+        buildPageItemsQuery(InboxViewFilter(), NotificationActionView.UNAVAILABLE_ARCHIVE, actionIds, "COUNT(*)"),
+    )
+
+    suspend fun selectionSnapshot(filter: InboxViewFilter, view: NotificationActionView, actionIds: Set<Long>): List<NotificationSelectionRow> =
+        dao.selectionSnapshot(buildPageItemsQuery(filter, view, actionIds, "itemId, sourcePackage, sourceUserRef"))
+
+    suspend fun archiveItems(ids: Set<Long>): ArchiveChange = database.withTransaction {
+        val changed = ids.chunked(400).flatMap { chunk ->
+            val existing = dao.existingItemIds(chunk).toSet()
+            val archived = dao.manualArchives(chunk).mapTo(hashSetOf()) { it.itemId }
+            (existing - archived).map { ManualArchiveEntity(it, System.currentTimeMillis()) }
+                .also { dao.insertManualArchives(it) }
+        }
+        ArchiveChange(changed, wasArchive = true)
+    }
+
+    suspend fun restoreItems(ids: Set<Long>): ArchiveChange = database.withTransaction {
+        val entries = ids.chunked(400).flatMap { chunk ->
+            dao.manualArchives(chunk).also { dao.removeManualArchives(chunk) }
+        }
+        ArchiveChange(entries, wasArchive = false)
+    }
+
+    suspend fun undoArchiveChange(change: ArchiveChange) = database.withTransaction {
+        if (change.wasArchive) {
+            change.entries.forEach { dao.undoManualArchive(it.itemId, it.archivedAtEpochMillis) }
+        } else {
+            change.entries.chunked(400).forEach { chunk ->
+                val existing = dao.existingItemIds(chunk.map { it.itemId }).toSet()
+                dao.insertManualArchives(chunk.filter { it.itemId in existing })
+            }
+        }
+    }
+
+    /** Recheck archive eligibility at commit time so actionable inbox records cannot be deleted. */
+    suspend fun deleteArchivedItems(ids: Set<Long>): Int {
+        val actionIds = runtimeActionItemIds.value
+        val deletedIds = database.withTransaction {
+            ids.chunked(400).flatMap { chunk ->
+                val manual = dao.manualArchives(chunk).mapTo(hashSetOf()) { it.itemId }
+                val eligible = dao.existingItemIds(chunk).filter { it in manual || it !in actionIds }
+                dao.removeManualArchives(eligible)
+                dao.deleteItems(eligible)
+                eligible
+            }
+        }
+        runtimeActionStore.removeAll(deletedIds)
+        return deletedIds.size
+    }
+
+    suspend fun setSourcesExcluded(packages: Set<String>, excluded: Boolean) {
+        database.withTransaction {
+            packages.forEach { name ->
+                val entry = ExcludedSourceEntity(name, System.currentTimeMillis())
+                if (excluded) dao.insertExcludedSource(entry) else dao.deleteExcludedSource(entry)
+            }
+        }
+        reconcilePolicyFromDatabase()
+    }
 
     suspend fun currentItemCount(): Long = dao.itemCount()
 
     suspend fun latestItem(): NotificationItemEntity? = dao.latestItem()
-
-    fun healthEvidenceSince(startEpochMillis: Long): Flow<List<HealthEvidenceEntity>> =
-        dao.observeHealthEvidenceSince(startEpochMillis)
 
     fun pagedItems(
         viewFilter: InboxViewFilter,
@@ -88,43 +146,12 @@ class NotificationRepository(
                 -> commitContent(observation, sourceLabel)
             }
         }
-        transactionResult.positiveEvidence?.let(positiveHealthEvidenceGate::markRecorded)
         val commit = transactionResult.commit
 
         if (observation.callbackKind != ObservedCallbackKind.REMOVED && commit != null) {
             runtimeActionStore.put(commit.item.itemId, captured.runtimeAction)
         }
         return commit
-    }
-
-    suspend fun recordHealth(
-        kind: String,
-        occurredAtEpochMillis: Long,
-        runtimeSessionId: String,
-        listenerConnectionId: String?,
-    ) {
-        val evidenceId = dao.insertHealthEvidence(
-            HealthEvidenceEntity(
-                kind = kind,
-                occurredAtEpochMillis = occurredAtEpochMillis,
-                runtimeSessionId = runtimeSessionId,
-                listenerConnectionId = listenerConnectionId,
-                itemId = null,
-            ),
-        )
-        try {
-            trimHealthEvidenceIfNeeded(evidenceId)
-        } finally {
-            if (kind in POSITIVE_HEALTH_KINDS && listenerConnectionId != null) {
-                positiveHealthEvidenceGate.markRecorded(
-                    PositiveHealthEvidence(
-                        runtimeSessionId = runtimeSessionId,
-                        listenerConnectionId = listenerConnectionId,
-                        occurredAtEpochMillis = occurredAtEpochMillis,
-                    ),
-                )
-            }
-        }
     }
 
     suspend fun reconcilePolicyFromDatabase() {
@@ -151,12 +178,6 @@ class NotificationRepository(
 
     fun hasRuntimeAction(item: NotificationItemEntity): Boolean = runtimeActionStore.contains(item.itemId)
 
-    suspend fun deleteItem(itemId: Long): Boolean {
-        require(itemId > 0L)
-        val deleted = database.withTransaction { dao.deleteItem(itemId) == 1 }
-        if (deleted) runtimeActionStore.remove(itemId)
-        return deleted
-    }
 
     private suspend fun commitContent(
         observation: NotificationObservation,
@@ -196,29 +217,7 @@ class NotificationRepository(
             presentationChanged -> NotificationChangeKind.UPDATED
             else -> NotificationChangeKind.NO_CONTENT_CHANGE
         }
-        val positiveEvidence = PositiveHealthEvidence(
-            runtimeSessionId = observation.runtimeSessionId,
-            listenerConnectionId = observation.listenerConnectionId,
-            occurredAtEpochMillis = observation.observedAtEpochMillis,
-        )
-        val shouldRecordPositiveEvidence = outcome.isNewItem ||
-            positiveHealthEvidenceGate.isDue(positiveEvidence, UPDATE_HEALTH_EVIDENCE_WINDOW_MILLIS)
-        if (shouldRecordPositiveEvidence) {
-            val evidenceId = dao.insertHealthEvidence(
-                HealthEvidenceEntity(
-                    kind = "NOTIFICATION_COMMITTED",
-                    occurredAtEpochMillis = observation.observedAtEpochMillis,
-                    runtimeSessionId = observation.runtimeSessionId,
-                    listenerConnectionId = observation.listenerConnectionId,
-                    itemId = itemId,
-                ),
-            )
-            trimHealthEvidenceIfNeeded(evidenceId)
-        }
-        return NotificationTransactionResult(
-            commit = NotificationCommit(committed, changeKind),
-            positiveEvidence = positiveEvidence.takeIf { shouldRecordPositiveEvidence },
-        )
+        return NotificationTransactionResult(NotificationCommit(committed, changeKind))
     }
 
     private suspend fun commitRemoval(observation: NotificationObservation): NotificationTransactionResult {
@@ -246,98 +245,21 @@ class NotificationRepository(
             runtimeSessionIdAtLastCapture = observation.runtimeSessionId,
         )
         dao.updateItem(removed)
-        val evidenceId = dao.insertHealthEvidence(
-            HealthEvidenceEntity(
-                kind = "NOTIFICATION_REMOVED",
-                occurredAtEpochMillis = observation.observedAtEpochMillis,
-                runtimeSessionId = observation.runtimeSessionId,
-                listenerConnectionId = observation.listenerConnectionId,
-                itemId = removed.itemId,
-            ),
-        )
-        trimHealthEvidenceIfNeeded(evidenceId)
-        return NotificationTransactionResult(
-            commit = NotificationCommit(removed, NotificationChangeKind.REMOVED),
-            positiveEvidence = PositiveHealthEvidence(
-                runtimeSessionId = observation.runtimeSessionId,
-                listenerConnectionId = observation.listenerConnectionId,
-                occurredAtEpochMillis = observation.observedAtEpochMillis,
-            ),
-        )
-    }
-
-    private suspend fun trimHealthEvidenceIfNeeded(latestEvidenceId: Long) {
-        if (latestEvidenceId % HEALTH_TRIM_INTERVAL == 0L) {
-            dao.trimHealthEvidence(HEALTH_EVIDENCE_LIMIT)
-        }
-    }
-
-    private companion object {
-        const val HEALTH_EVIDENCE_LIMIT = 10_000
-        const val HEALTH_TRIM_INTERVAL = 256L
-        const val UPDATE_HEALTH_EVIDENCE_WINDOW_MILLIS = 5 * 60 * 1_000L
-        val POSITIVE_HEALTH_KINDS = setOf(
-            "LISTENER_CONNECTED",
-            "NOTIFICATION_COMMITTED",
-            "NOTIFICATION_REMOVED",
-            "RECOVERY_COMPLETED",
-        )
+        return NotificationTransactionResult(NotificationCommit(removed, NotificationChangeKind.REMOVED))
     }
 }
 
-private data class NotificationTransactionResult(
-    val commit: NotificationCommit?,
-    val positiveEvidence: PositiveHealthEvidence? = null,
-)
-
-internal data class PositiveHealthEvidence(
-    val runtimeSessionId: String,
-    val listenerConnectionId: String,
-    val occurredAtEpochMillis: Long,
-)
-
-internal class PositiveHealthEvidenceGate(
-    private val maxRememberedConnections: Int = 16,
-) {
-    private data class ConnectionKey(
-        val runtimeSessionId: String,
-        val listenerConnectionId: String,
-    )
-
-    private val lastRecordedAtByConnection = object : LinkedHashMap<ConnectionKey, Long>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ConnectionKey, Long>?): Boolean =
-            size > maxRememberedConnections
-    }
-
-    init {
-        require(maxRememberedConnections > 0)
-    }
-
-    @Synchronized
-    fun isDue(evidence: PositiveHealthEvidence, minimumIntervalMillis: Long): Boolean {
-        require(minimumIntervalMillis >= 0L)
-        val lastRecordedAt = lastRecordedAtByConnection[evidence.connectionKey()] ?: return true
-        return evidence.occurredAtEpochMillis < lastRecordedAt ||
-            evidence.occurredAtEpochMillis - lastRecordedAt >= minimumIntervalMillis
-    }
-
-    @Synchronized
-    fun markRecorded(evidence: PositiveHealthEvidence) {
-        lastRecordedAtByConnection[evidence.connectionKey()] = evidence.occurredAtEpochMillis
-    }
-
-    private fun PositiveHealthEvidence.connectionKey() = ConnectionKey(
-        runtimeSessionId = runtimeSessionId,
-        listenerConnectionId = listenerConnectionId,
-    )
-}
+private data class NotificationTransactionResult(val commit: NotificationCommit?)
 
 enum class NotificationActionView { ACTIONABLE, UNAVAILABLE_ARCHIVE }
+
+data class ArchiveChange(val entries: List<ManualArchiveEntity>, val wasArchive: Boolean)
 
 internal fun buildPageItemsQuery(
     viewFilter: InboxViewFilter,
     actionView: NotificationActionView,
     runtimeActionItemIds: Set<Long>,
+    projection: String = "*",
 ): SupportSQLiteQuery {
     require(runtimeActionItemIds.all { itemId -> itemId > 0L })
     val orderedItemIds = runtimeActionItemIds.sorted()
@@ -347,6 +269,12 @@ internal fun buildPageItemsQuery(
         actionView == NotificationActionView.ACTIONABLE ->
             "itemId IN (${orderedItemIds.joinToString(separator = ",")})"
         else -> "itemId NOT IN (${orderedItemIds.joinToString(separator = ",")})"
+    }
+    val archivePredicate = "itemId IN (SELECT itemId FROM manual_archives)"
+    val pagePredicate = if (actionView == NotificationActionView.ACTIONABLE) {
+        "($actionPredicate AND NOT $archivePredicate)"
+    } else {
+        "($actionPredicate OR $archivePredicate)"
     }
     val sourceSet = if (viewFilter.includedSources.isNotEmpty()) {
         viewFilter.includedSources
@@ -363,13 +291,13 @@ internal fun buildPageItemsQuery(
         listOf(source.sourcePackage, source.sourceUserRef)
     }.toTypedArray()
     val where = when {
-        sourcePredicate.isEmpty() -> actionPredicate
-        viewFilter.includedSources.isNotEmpty() -> "$actionPredicate AND ($sourcePredicate)"
-        else -> "$actionPredicate AND NOT ($sourcePredicate)"
+        sourcePredicate.isEmpty() -> pagePredicate
+        viewFilter.includedSources.isNotEmpty() -> "$pagePredicate AND ($sourcePredicate)"
+        else -> "$pagePredicate AND NOT ($sourcePredicate)"
     }
     return SimpleSQLiteQuery(
-        "SELECT * FROM notification_items WHERE $where " +
-            "ORDER BY sortTimeEpochMillis DESC, itemId DESC",
+        "SELECT $projection FROM notification_items WHERE $where " +
+            (if (projection == "COUNT(*)") "" else "ORDER BY sortTimeEpochMillis DESC, itemId DESC"),
         arguments,
     )
 }

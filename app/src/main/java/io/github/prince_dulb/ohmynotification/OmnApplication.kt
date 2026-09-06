@@ -1,10 +1,6 @@
 package io.github.prince_dulb.ohmynotification
 
 import android.app.Application
-import android.Manifest
-import android.app.NotificationManager
-import android.content.pm.PackageManager
-import io.github.prince_dulb.ohmynotification.capture.OmnNotificationListenerComponent
 import io.github.prince_dulb.ohmynotification.capture.ListenerRebindController
 import io.github.prince_dulb.ohmynotification.capture.NotificationSnapshotFactory
 import io.github.prince_dulb.ohmynotification.capture.RuntimeActionStore
@@ -23,7 +19,6 @@ import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 
@@ -37,23 +32,11 @@ class OmnApplication : Application() {
         runBlocking {
             withContext(Dispatchers.IO) { graph.repository.reconcilePolicyFromDatabase() }
         }
-        graph.serialScope.launch {
-            graph.repository.recordHealth(
-                kind = "PROCESS_STARTED",
-                occurredAtEpochMillis = System.currentTimeMillis(),
-                runtimeSessionId = graph.runtimeSessionId,
-                listenerConnectionId = null,
-            )
-            graph.recordCurrentHealthFacets()
-        }
+
     }
 }
 
 class OmnAppGraph(application: Application) {
-    private val applicationContext = application
-    private var lastAccessKind: String? = null
-    private var lastPermissionKind: String? = null
-    private var lastChannelKind: String? = null
     val runtimeSessionId: String = UUID.randomUUID().toString()
     val serialScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
     val policyStore = MonitoringPolicyStore(application.packageName)
@@ -79,47 +62,4 @@ class OmnAppGraph(application: Application) {
         policyStore = policyStore,
     )
 
-    suspend fun recordCurrentHealthFacets() {
-        val notificationManager = applicationContext.getSystemService(NotificationManager::class.java)
-        val accessKind = if (notificationManager.isNotificationListenerAccessGranted(
-                OmnNotificationListenerComponent.componentName(applicationContext),
-            )
-        ) {
-            "ACCESS_GRANTED"
-        } else {
-            "ACCESS_NOT_GRANTED"
-        }
-        val permissionKind = if (
-            applicationContext.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            "STATUS_PERMISSION_GRANTED"
-        } else {
-            "STATUS_PERMISSION_DENIED"
-        }
-        val channelKind = if (statusNotificationController.isChannelEnabled()) {
-            "STATUS_CHANNEL_ENABLED"
-        } else {
-            "STATUS_CHANNEL_DISABLED"
-        }
-        val changedKinds = synchronized(this) {
-            buildList {
-                if (lastAccessKind != accessKind) add(accessKind)
-                if (lastPermissionKind != permissionKind) add(permissionKind)
-                if (lastChannelKind != channelKind) add(channelKind)
-                lastAccessKind = accessKind
-                lastPermissionKind = permissionKind
-                lastChannelKind = channelKind
-            }
-        }
-        val observedAt = System.currentTimeMillis()
-        changedKinds.forEach { kind ->
-            repository.recordHealth(
-                kind = kind,
-                occurredAtEpochMillis = observedAt,
-                runtimeSessionId = runtimeSessionId,
-                listenerConnectionId = null,
-            )
-        }
-    }
 }

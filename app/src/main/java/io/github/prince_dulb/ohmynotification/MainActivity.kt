@@ -1,6 +1,21 @@
 package io.github.prince_dulb.ohmynotification
 
 import android.Manifest
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
+import android.net.Uri
+import android.os.PowerManager
+import android.widget.Toast
+import io.github.prince_dulb.ohmynotification.ui.OnboardingScreen
+import io.github.prince_dulb.ohmynotification.ui.UpdateCard
+import io.github.prince_dulb.ohmynotification.ui.BatchAction
+import io.github.prince_dulb.ohmynotification.ui.BatchResult
+import io.github.prince_dulb.ohmynotification.data.AppUserKey
+import io.github.prince_dulb.ohmynotification.data.InboxViewFilter
+import io.github.prince_dulb.ohmynotification.update.AppUpdater
+import io.github.prince_dulb.ohmynotification.update.UpdatePolicy
 import android.app.NotificationManager
 import android.content.ActivityNotFoundException
 import android.content.Intent
@@ -32,6 +47,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
+    private val onboardingVisible = mutableStateOf(false)
+    private val updater by lazy { AppUpdater(this) }
+    private var verifyingInstall = false
+    private val downloadReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == DownloadManager.ACTION_DOWNLOAD_COMPLETE) lifecycleScope.launch { updater.refresh() }
+        }
+    }
+    private val unknownSourcesLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        if (packageManager.canRequestPackageInstalls()) installUpdate()
+        else Toast.makeText(this, "未允许安装，下载的更新仍可稍后安装", Toast.LENGTH_LONG).show()
+    }
     private val uiState = mutableStateOf(AppUiState())
     private var automaticRebindJob: Job? = null
     private val connectionListener: (Boolean) -> Unit = {
@@ -55,17 +82,35 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        onboardingVisible.value = !getSharedPreferences("omn-onboarding", MODE_PRIVATE).getBoolean("v1.1-completed", false)
+        refreshUiState()
         setContent {
             OhMyNotificationTheme {
-                OmnAppScreen(
+                if (onboardingVisible.value) OnboardingScreen(
+                    state = uiState.value,
+                    onAccess = ::openNotificationAccessSettings,
+                    onNotifications = {
+                        if (!uiState.value.statusNotificationGranted) requestStatusNotificationPermission()
+                        else openStatusNotificationChannel()
+                    },
+                    onBattery = { openSystemSettings(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) },
+                    onAppSettings = { openSystemSettings(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) },
+                    onFinish = {
+                        lifecycleScope.launch {
+                            val saved = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                getSharedPreferences("omn-onboarding", MODE_PRIVATE).edit().putBoolean("v1.1-completed", true).commit()
+                            }
+                            if (saved) onboardingVisible.value = false
+                            else Toast.makeText(this@MainActivity, "引导状态未能保存，请重试", Toast.LENGTH_LONG).show()
+                        }
+                    },
+                ) else OmnAppScreen(
                     state = uiState.value,
                     repository = (application as OmnApplication).graph.repository,
                     inboxViewFilter =
                         (application as OmnApplication).graph.inboxViewPreferencesStore.filter,
                     appSettings = (application as OmnApplication).graph.appSettingsStore.settings,
                     currentUserRef = android.os.Process.myUserHandle().toString(),
-                    currentRuntimeSessionId = (application as OmnApplication).graph.runtimeSessionId,
-                    currentListenerConnectionId = ListenerRuntimeState.connectionId(),
                     loadLaunchableSources =
                         (application as OmnApplication).graph.sourceLabelResolver::launchableSources,
                     onOpenNotificationAccess = ::openNotificationAccessSettings,
@@ -80,7 +125,20 @@ class MainActivity : ComponentActivity() {
                     onApplyInboxViewFilter =
                         (application as OmnApplication).graph.inboxViewPreferencesStore::setFilter,
                     onOpenNotification = ::openNotification,
-                    onDeleteNotification = ::deleteNotification,
+                    onBatchAction = ::performBatch,
+                    onUndoArchive = { change ->
+                        serialMutation {
+                            val graph = (application as OmnApplication).graph
+                            graph.repository.undoArchiveChange(change)
+                            refreshSummary()
+                        }
+                    },
+                    onOpenOnboarding = { onboardingVisible.value = true },
+                    updateContent = {
+                        UpdateCard(updater, ::installUpdate) {
+                            openSystemSettings(Intent(Intent.ACTION_VIEW, Uri.parse(UpdatePolicy.RELEASES_URL)))
+                        }
+                    },
                 )
             }
         }
@@ -88,6 +146,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        registerReceiver(downloadReceiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE), RECEIVER_EXPORTED)
         ListenerRuntimeState.addListener(connectionListener)
         refreshUiState()
         automaticRebindJob?.cancel()
@@ -101,10 +160,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        lifecycleScope.launch { updater.refresh() }
         refreshUiState()
     }
 
     override fun onStop() {
+        unregisterReceiver(downloadReceiver)
         automaticRebindJob?.cancel()
         automaticRebindJob = null
         ListenerRuntimeState.removeListener(connectionListener)
@@ -115,6 +176,7 @@ class MainActivity : ComponentActivity() {
         val notificationManager = getSystemService(NotificationManager::class.java)
         val graph = (application as OmnApplication).graph
         uiState.value = AppUiState(
+            batteryUnrestricted = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName),
             listenerAccessGranted = notificationManager.isNotificationListenerAccessGranted(
                 OmnNotificationListenerComponent.componentName(this),
             ),
@@ -126,7 +188,6 @@ class MainActivity : ComponentActivity() {
             statusNotificationChannelEnabled =
                 graph.statusNotificationController.isChannelEnabled(),
         )
-        graph.serialScope.launch { graph.recordCurrentHealthFacets() }
         graph.serialScope.launch {
             graph.statusNotificationController.onExternalStateChanged(
                 currentRecordCount = graph.repository.currentItemCount(),
@@ -195,20 +256,71 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun deleteNotification(item: NotificationItemEntity): Boolean {
+    private suspend fun <T> serialMutation(block: suspend () -> T): T {
         val graph = (application as OmnApplication).graph
-        val result = CompletableDeferred<Boolean>()
+        val result = CompletableDeferred<T>()
         graph.serialScope.launch {
-            val deleted = runCatching { graph.repository.deleteItem(item.itemId) }.getOrDefault(false)
-            if (deleted) {
-                graph.statusNotificationController.onItemDeleted(
-                    currentRecordCount = graph.repository.currentItemCount(),
-                    latestItem = graph.repository.latestItem(),
-                )
-            }
-            result.complete(deleted)
+            try { result.complete(block()) } catch (failure: Throwable) { result.completeExceptionally(failure) }
         }
         return result.await()
+    }
+
+    private suspend fun refreshSummary() {
+        val graph = (application as OmnApplication).graph
+        graph.statusNotificationController.onItemDeleted(
+            currentRecordCount = graph.repository.currentItemCount(),
+            latestItem = graph.repository.latestItem(),
+        )
+    }
+
+    private suspend fun performBatch(ids: Set<Long>, sources: Set<AppUserKey>, action: BatchAction): BatchResult = serialMutation {
+        val graph = (application as OmnApplication).graph
+        val result = when (action) {
+            BatchAction.ARCHIVE -> graph.repository.archiveItems(ids).let { BatchResult(it.entries.size, it) }
+            BatchAction.RESTORE -> graph.repository.restoreItems(ids).let { BatchResult(it.entries.size, it) }
+            BatchAction.DELETE -> BatchResult(graph.repository.deleteArchivedItems(ids))
+            BatchAction.STOP, BatchAction.START -> {
+                val packages = sources.mapTo(hashSetOf()) { it.sourcePackage }
+                graph.repository.setSourcesExcluded(packages, action == BatchAction.STOP)
+                BatchResult(packages.size)
+            }
+            BatchAction.ONLY, BatchAction.HIDE -> {
+                val old = graph.inboxViewPreferencesStore.filter.value
+                val next = if (action == BatchAction.ONLY) InboxViewFilter(includedSources = sources) else {
+                    val remaining = old.includedSources - sources
+                    if (old.includedSources.isNotEmpty() && remaining.isNotEmpty()) InboxViewFilter(includedSources = remaining)
+                    else InboxViewFilter(excludedSources = old.excludedSources + sources)
+                }
+                check(graph.inboxViewPreferencesStore.setFilter(next)) { "未能保存来源筛选" }
+                BatchResult(sources.size)
+            }
+        }
+        refreshSummary()
+        result
+    }
+
+    private fun openSystemSettings(intent: Intent) {
+        try { startActivity(intent) }
+        catch (_: ActivityNotFoundException) { Toast.makeText(this, "系统没有提供此设置入口，请手动进入系统设置", Toast.LENGTH_LONG).show() }
+        catch (_: SecurityException) { Toast.makeText(this, "系统拒绝打开该页面，请手动进入系统设置", Toast.LENGTH_LONG).show() }
+    }
+
+    private fun installUpdate() {
+        if (verifyingInstall) return
+        verifyingInstall = true
+        lifecycleScope.launch {
+            try {
+                val intent = updater.verifiedInstallIntent()
+                if (!packageManager.canRequestPackageInstalls()) {
+                    unknownSourcesLauncher.launch(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+                } else {
+                    startActivity(intent)
+                }
+            } catch (failure: Exception) {
+                if (failure is kotlinx.coroutines.CancellationException) throw failure
+                Toast.makeText(this@MainActivity, failure.message ?: "无法安装更新", Toast.LENGTH_LONG).show()
+            } finally { verifyingInstall = false }
+        }
     }
 
     private companion object {

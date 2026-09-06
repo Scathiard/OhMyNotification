@@ -124,7 +124,6 @@ if (-not $RequireRelease -and -not $isDebuggable) {
 }
 
 $forbiddenPermissions = @(
-    'android.permission.INTERNET',
     'android.permission.GET_ACCOUNTS',
     'android.permission.READ_CONTACTS',
     'android.permission.QUERY_ALL_PACKAGES'

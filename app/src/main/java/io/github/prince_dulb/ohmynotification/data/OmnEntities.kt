@@ -84,3 +84,15 @@ data class AppUserKey(
         require(sourcePackage.isNotBlank())
     }
 }
+
+@Entity(tableName = "manual_archives")
+data class ManualArchiveEntity(
+    @PrimaryKey val itemId: Long,
+    val archivedAtEpochMillis: Long,
+)
+
+data class NotificationSelectionRow(
+    val itemId: Long,
+    val sourcePackage: String,
+    val sourceUserRef: String,
+)

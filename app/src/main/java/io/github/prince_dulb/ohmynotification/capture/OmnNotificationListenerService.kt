@@ -161,12 +161,6 @@ class OmnNotificationListenerService : NotificationListenerService() {
     private suspend fun process(work: ListenerWork) {
         when (work) {
             is ListenerWork.Connected -> {
-                graph.repository.recordHealth(
-                    kind = "LISTENER_CONNECTED",
-                    occurredAtEpochMillis = work.observedAtEpochMillis,
-                    runtimeSessionId = graph.runtimeSessionId,
-                    listenerConnectionId = work.connectionId,
-                )
                 graph.statusNotificationController.onListenerConnectionChanged(
                     isConnected = true,
                     currentRecordCount = graph.repository.currentItemCount(),
@@ -180,25 +174,9 @@ class OmnNotificationListenerService : NotificationListenerService() {
                     graph.statusNotificationController::onCommitted,
                 )
             }
-            is ListenerWork.RecoveryCompleted -> graph.repository.recordHealth(
-                kind = "RECOVERY_COMPLETED",
-                occurredAtEpochMillis = work.observedAtEpochMillis,
-                runtimeSessionId = graph.runtimeSessionId,
-                listenerConnectionId = work.connectionId,
-            )
-            is ListenerWork.RecoveryFailed -> graph.repository.recordHealth(
-                kind = "RECOVERY_FAILED",
-                occurredAtEpochMillis = work.observedAtEpochMillis,
-                runtimeSessionId = graph.runtimeSessionId,
-                listenerConnectionId = work.connectionId,
-            )
+            is ListenerWork.RecoveryCompleted -> Unit
+            is ListenerWork.RecoveryFailed -> Unit
             is ListenerWork.Disconnected -> {
-                graph.repository.recordHealth(
-                    kind = "LISTENER_DISCONNECTED",
-                    occurredAtEpochMillis = work.observedAtEpochMillis,
-                    runtimeSessionId = graph.runtimeSessionId,
-                    listenerConnectionId = work.connectionId,
-                )
                 graph.statusNotificationController.onListenerConnectionChanged(isConnected = false)
             }
             is ListenerWork.RecoveryBarrier -> work.completed.complete(Unit)

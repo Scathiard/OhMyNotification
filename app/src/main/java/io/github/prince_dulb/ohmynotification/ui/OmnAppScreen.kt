@@ -5,8 +5,8 @@ import android.graphics.Bitmap
 import android.graphics.Canvas as AndroidCanvas
 import android.util.LruCache
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -38,6 +38,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -55,10 +56,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -78,9 +77,6 @@ import io.github.prince_dulb.ohmynotification.capture.RuntimeActionStatus
 import io.github.prince_dulb.ohmynotification.capture.LaunchableSource
 import io.github.prince_dulb.ohmynotification.core.model.AppSettingsSnapshot
 import io.github.prince_dulb.ohmynotification.core.model.NotificationType
-import io.github.prince_dulb.ohmynotification.core.health.HealthFact
-import io.github.prince_dulb.ohmynotification.core.health.HealthTimelineDeriver
-import io.github.prince_dulb.ohmynotification.core.health.HealthTimelineQuery
 import io.github.prince_dulb.ohmynotification.core.health.StatusPresentationDeriver
 import io.github.prince_dulb.ohmynotification.core.health.StatusPresentationState
 import io.github.prince_dulb.ohmynotification.data.NotificationItemEntity
@@ -103,6 +99,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 data class AppUiState(
+    val batteryUnrestricted: Boolean = false,
     val listenerAccessGranted: Boolean = false,
     val listenerConnected: Boolean = false,
     val listenerConnectionObserved: Boolean = false,
@@ -118,8 +115,6 @@ internal fun OmnAppScreen(
     inboxViewFilter: Flow<InboxViewFilter>,
     appSettings: Flow<AppSettingsSnapshot>,
     currentUserRef: String,
-    currentRuntimeSessionId: String,
-    currentListenerConnectionId: String?,
     loadLaunchableSources: () -> List<LaunchableSource>,
     onOpenNotificationAccess: () -> Unit,
     onRequestStatusNotification: () -> Unit,
@@ -130,7 +125,10 @@ internal fun OmnAppScreen(
     onSetGroupingWindowMinutes: suspend (Int) -> Boolean,
     onApplyInboxViewFilter: suspend (InboxViewFilter) -> Boolean,
     onOpenNotification: suspend (NotificationItemEntity) -> RuntimeActionStatus,
-    onDeleteNotification: suspend (NotificationItemEntity) -> Boolean,
+    onBatchAction: suspend (Set<Long>, Set<AppUserKey>, BatchAction) -> BatchResult,
+    onUndoArchive: suspend (io.github.prince_dulb.ohmynotification.data.ArchiveChange) -> Unit,
+    onOpenOnboarding: () -> Unit,
+    updateContent: @Composable () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val sources by repository.sourceSummaries.collectAsStateWithLifecycle(emptyList())
@@ -140,8 +138,10 @@ internal fun OmnAppScreen(
     }
     val viewFilter by inboxViewFilter.collectAsStateWithLifecycle(InboxViewFilter())
     val settings by appSettings.collectAsStateWithLifecycle(AppSettingsSnapshot.DEFAULT)
-    val totalItemCount by repository.itemCount.collectAsStateWithLifecycle(0L)
     val runtimeActionItemIds by repository.runtimeActionItemIds.collectAsStateWithLifecycle(emptySet())
+    val archiveCount by remember(runtimeActionItemIds) {
+        repository.archiveCount(runtimeActionItemIds)
+    }.collectAsStateWithLifecycle(0L)
     val launchableSources by produceState(emptyList<LaunchableSource>()) {
         value = withContext(Dispatchers.IO) { loadLaunchableSources() }
     }
@@ -213,44 +213,83 @@ internal fun OmnAppScreen(
     }
     val pagingItems = pagingFlow.collectAsLazyPagingItems()
     val loadedItems = pagingItems.itemSnapshotList.items
+    val loadedIds = loadedItems.map { it.itemId }
+    val manualArchiveIds by remember(loadedIds) {
+        repository.manualArchiveIds(loadedIds)
+    }.collectAsStateWithLifecycle(emptyList())
     val nodes = remember(loadedItems, settings.groupingWindowMinutes) {
         groupTimeline(loadedItems, settings.groupingWindowMinutes)
     }
-    val healthStart = loadedItems.lastOrNull()?.firstReceivedAtEpochMillis ?: Long.MAX_VALUE
-    val healthEvidence by remember(healthStart) {
-        repository.healthEvidenceSince(healthStart)
-    }.collectAsStateWithLifecycle(emptyList())
-    val observedNow = remember(loadedItems, healthEvidence, currentListenerConnectionId) {
-        System.currentTimeMillis()
-    }
-    val healthIntervals = remember(
-        healthStart,
-        observedNow,
-        healthEvidence,
-        currentRuntimeSessionId,
-        currentListenerConnectionId,
-    ) {
-        if (healthStart == Long.MAX_VALUE) {
-            emptyList()
-        } else {
-            HealthTimelineDeriver.derive(
-                facts = healthEvidence.map { evidence ->
-                    HealthFact(
-                        evidenceId = evidence.evidenceId,
-                        kind = evidence.kind,
-                        occurredAtEpochMillis = evidence.occurredAtEpochMillis,
-                        runtimeSessionId = evidence.runtimeSessionId,
-                        listenerConnectionId = evidence.listenerConnectionId,
-                    )
-                },
-                query = HealthTimelineQuery(
-                    rangeStartEpochMillis = healthStart,
-                    rangeEndEpochMillis = maxOf(observedNow, healthStart + 1L),
-                    currentRuntimeSessionId = currentRuntimeSessionId,
-                    currentListenerConnectionId = currentListenerConnectionId,
-                ),
-            )
+    var selecting by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf(emptyMap<Long, AppUserKey>()) }
+    var busy by remember { mutableStateOf(false) }
+    var pendingDelete by remember { mutableStateOf<Map<Long, AppUserKey>?>(null) }
+    var pendingSourceAction by remember { mutableStateOf<Pair<BatchAction, Map<Long, AppUserKey>>?>(null) }
+    fun execute(action: BatchAction, targets: Map<Long, AppUserKey>) {
+        if (busy || targets.isEmpty()) return
+        busy = true
+        coroutineScope.launch {
+            val result = try {
+                onBatchAction(targets.keys, targets.values.toSet(), action).also {
+                    selected = emptyMap()
+                    selecting = false
+                }
+            } catch (cancel: kotlinx.coroutines.CancellationException) {
+                throw cancel
+            } catch (_: Exception) {
+                null
+            } finally {
+                busy = false
+            }
+            if (result == null) {
+                snackbar.showSnackbar("操作未能完成，请重试")
+                return@launch
+            }
+            val message = when (action) {
+                BatchAction.ARCHIVE -> "已归档 ${result.count} 条通知"
+                BatchAction.RESTORE -> "已取消 ${result.count} 条手动归档；没有跳转动作的记录仍留在这里"
+                BatchAction.DELETE -> "已永久删除 ${result.count} 条记录"
+                else -> "已对 ${result.count} 个来源应用执行：${action.label}"
+            }
+            val answer = snackbar.showSnackbar(message, actionLabel = result.undo?.let { "撤销" })
+            if (answer == SnackbarResult.ActionPerformed && result.undo != null) {
+                try { onUndoArchive(result.undo) }
+                catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
+                catch (_: Exception) { snackbar.showSnackbar("撤销失败，请到归档页重试") }
+            }
         }
+    }
+
+    fun requestAction(action: BatchAction, targets: Map<Long, AppUserKey>) {
+        when (action) {
+            BatchAction.DELETE -> pendingDelete = targets.toMap()
+            BatchAction.STOP, BatchAction.START -> pendingSourceAction = action to targets.toMap()
+            else -> execute(action, targets.toMap())
+        }
+    }
+    LaunchedEffect(destination, viewFilter) {
+        selecting = false
+        selected = emptyMap()
+    }
+    if (pendingDelete != null) {
+        val targets = requireNotNull(pendingDelete)
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("永久删除 ${targets.size} 条记录？") },
+            text = { Text("这会永久删除所选 ${targets.size} 条归档通知和当前跳转动作，无法恢复。来源以后再次发送或更新时仍可能重新出现。") },
+            confirmButton = { TextButton(onClick = { pendingDelete = null; execute(BatchAction.DELETE, targets) }) { Text("永久删除 ${targets.size} 条") } },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("取消") } },
+        )
+    }
+    pendingSourceAction?.let { (action, targets) ->
+        val appCount = targets.values.map { it.sourcePackage }.toSet().size
+        AlertDialog(
+            onDismissRequest = { pendingSourceAction = null },
+            title = { Text("${action.label}（$appCount 个 App）？") },
+            text = { Text("只影响未来通知，已有记录保留。对同一 App 的所有资料生效；排除期间的通知无法补回。") },
+            confirmButton = { TextButton(onClick = { pendingSourceAction = null; execute(action, targets) }) { Text("确认") } },
+            dismissButton = { TextButton(onClick = { pendingSourceAction = null }) { Text("取消") } },
+        )
     }
     val inboxListState = rememberLazyListState()
     val archiveListState = rememberLazyListState()
@@ -286,13 +325,19 @@ internal fun OmnAppScreen(
         destination = AppDestination.INBOX
     }
 
+    BackHandler(enabled = selecting) {
+        if (!busy) { selecting = false; selected = emptyMap() }
+    }
+
     if (destination == AppDestination.SETTINGS) {
         Surface(modifier = modifier.fillMaxSize()) {
             SettingsScreen(
                 settings = settings,
                 snackbarHostState = snackbar,
                 onBack = { destination = AppDestination.INBOX },
-                unavailableArchiveCount = (totalItemCount - runtimeActionItemIds.size).coerceAtLeast(0L),
+                unavailableArchiveCount = archiveCount,
+                onOpenOnboarding = onOpenOnboarding,
+                updateContent = updateContent,
                 onOpenUnavailableArchive = { destination = AppDestination.UNAVAILABLE_ARCHIVE },
                 onManageExcludedApps = { dialog = SourceDialog.EXCLUDE },
                 onSetNotificationTypeRecorded = onSetNotificationTypeRecorded,
@@ -301,15 +346,37 @@ internal fun OmnAppScreen(
         }
     } else Surface(modifier = modifier.fillMaxSize()) {
         Box(Modifier.fillMaxSize()) {
+          Column(Modifier.fillMaxSize().safeDrawingPadding()) {
+            if (selecting) SelectionToolbar(
+                count = selected.size,
+                archive = actionView == NotificationActionView.UNAVAILABLE_ARCHIVE,
+                busy = busy,
+                onExit = { selecting = false; selected = emptyMap() },
+                onSelectAll = {
+                    busy = true
+                    val snapshotFilter = viewFilter
+                    val snapshotView = actionView
+                    val snapshotActions = runtimeActionItemIds.toSet()
+                    coroutineScope.launch {
+                        try {
+                            selected = repository.selectionSnapshot(snapshotFilter, snapshotView, snapshotActions)
+                                .associate { it.itemId to AppUserKey(it.sourceUserRef, it.sourcePackage) }
+                        } catch (_: Exception) { snackbar.showSnackbar("全选失败，请重试") }
+                        finally { busy = false }
+                    }
+                },
+                onAction = { requestAction(it, selected) },
+            )
             LazyColumn(
                 state = listState,
                 modifier = Modifier
-                    .fillMaxSize()
-                    .safeDrawingPadding(),
+                    .weight(1f)
+                    .fillMaxWidth(),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(20.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                item(key = "header") {
+                if (!selecting) item(key = "header") {
+                    if (!selecting) TextButton(onClick = { selecting = true }) { Text("批量操作") }
                     if (destination == AppDestination.UNAVAILABLE_ARCHIVE) {
                         UnavailableArchiveHeader(
                             selectedCount = viewFilter.includedSources.size,
@@ -359,20 +426,9 @@ internal fun OmnAppScreen(
                     }
                 }
 
-                itemsIndexed(nodes, key = { _, node -> node.key }) { index, node ->
-                    val next = nodes.getOrNull(index + 1)
-                    val confirmedToNext = if (next == null) {
-                        null
-                    } else {
-                        HealthTimelineDeriver.isFullyConfirmed(
-                            intervals = healthIntervals,
-                            startEpochMillis = next.anchor.firstReceivedAtEpochMillis,
-                            endEpochMillis = node.anchor.firstReceivedAtEpochMillis,
-                        )
-                    }
+                itemsIndexed(nodes, key = { _, node -> node.key }) { _, node ->
                     TimelineNodeCard(
                         node = node,
-                        confirmedToNext = confirmedToNext,
                         expanded = drawerExpanded(expandedDrawers, node.anchor.itemId),
                         onToggle = {
                             val itemId = node.anchor.itemId
@@ -389,16 +445,18 @@ internal fun OmnAppScreen(
                             snackbar.showSnackbar(message)
                             status
                         },
-                        onDelete = { item ->
-                            val deleted = onDeleteNotification(item)
-                            coroutineScope.launch {
-                                snackbar.showSnackbar(
-                                    if (deleted) "已删除 1 条通知记录"
-                                    else "删除失败，记录仍保留在本机",
-                                )
+                        selecting = selecting,
+                        selectedIds = selected.keys,
+                        busy = busy,
+                        manualArchiveIds = manualArchiveIds.toSet(),
+                        onSelect = { item ->
+                            if (!busy) {
+                                selecting = true
+                                selected = if (item.itemId in selected) selected - item.itemId
+                                    else selected + (item.itemId to item.sourceKey())
                             }
-                            deleted
                         },
+                        onEntryAction = { item, action -> requestAction(action, mapOf(item.itemId to item.sourceKey())) },
                         hasRuntimeAction = repository::hasRuntimeAction,
                         allowRecoveryAttempt = actionView == NotificationActionView.UNAVAILABLE_ARCHIVE,
                         excludedPackages = excludedPackages,
@@ -460,6 +518,7 @@ internal fun OmnAppScreen(
                     }
                 }
             }
+          }
             SnackbarHost(
                 hostState = snackbar,
                 modifier = Modifier.align(Alignment.BottomCenter).safeDrawingPadding(),
@@ -569,9 +628,9 @@ private fun InboxHeader(
         Card(
             colors = CardDefaults.cardColors(
                 containerColor = if (healthy) {
-                    ConfirmedBlue.copy(alpha = 0.12f)
+                    MaterialTheme.colorScheme.secondaryContainer
                 } else {
-                    UnconfirmedYellow.copy(alpha = 0.18f)
+                    MaterialTheme.colorScheme.errorContainer
                 },
             ),
         ) {
@@ -628,11 +687,6 @@ private fun InboxHeader(
                 Text("设置")
             }
         }
-        Text(
-            text = "蓝色实线：已确认运行　黄色虚线：未确认运行",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.labelMedium,
-        )
     }
 }
 
@@ -646,7 +700,7 @@ private fun UnavailableArchiveHeader(
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         TextButton(onClick = onBack) { Text("返回可跳转通知") }
         Text(
-            text = "当前无跳转动作归档",
+            text = "已归档通知",
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.Bold,
         )
@@ -664,11 +718,15 @@ private fun UnavailableArchiveHeader(
 @Composable
 private fun TimelineNodeCard(
     node: TimelineNode,
-    confirmedToNext: Boolean?,
     expanded: Boolean,
     onToggle: () -> Unit,
     onOpen: suspend (NotificationItemEntity) -> RuntimeActionStatus,
-    onDelete: suspend (NotificationItemEntity) -> Boolean,
+    selecting: Boolean,
+    selectedIds: Set<Long>,
+    busy: Boolean,
+    manualArchiveIds: Set<Long>,
+    onSelect: (NotificationItemEntity) -> Unit,
+    onEntryAction: (NotificationItemEntity, BatchAction) -> Unit,
     hasRuntimeAction: (NotificationItemEntity) -> Boolean,
     allowRecoveryAttempt: Boolean,
     excludedPackages: Set<String>,
@@ -688,7 +746,6 @@ private fun TimelineNodeCard(
         modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        HealthRail(confirmed = confirmedToNext)
         Card(modifier = Modifier.weight(1f)) {
             Column(Modifier.fillMaxWidth()) {
                 Row(
@@ -720,6 +777,7 @@ private fun TimelineNodeCard(
                     }
                     Box {
                         IconButton(
+                            enabled = !selecting && !busy,
                             onClick = { actionMenuExpanded = true },
                             modifier = Modifier.semantics {
                                 contentDescription = "${source.sourceName()} 应用操作"
@@ -773,7 +831,12 @@ private fun TimelineNodeCard(
                     NotificationEntry(
                         item = item,
                         onOpen = onOpen,
-                        onDelete = onDelete,
+                        selecting = selecting,
+                        selected = item.itemId in selectedIds,
+                        busy = busy,
+                        manuallyArchived = item.itemId in manualArchiveIds,
+                        onSelect = { onSelect(item) },
+                        onAction = { onEntryAction(item, it) },
                         hasRuntimeAction = hasRuntimeAction,
                         allowRecoveryAttempt = allowRecoveryAttempt,
                         showTime = node.members.size > 1,
@@ -853,162 +916,55 @@ private fun TimelineNodeCard(
 private fun NotificationEntry(
     item: NotificationItemEntity,
     onOpen: suspend (NotificationItemEntity) -> RuntimeActionStatus,
-    onDelete: suspend (NotificationItemEntity) -> Boolean,
+    selecting: Boolean,
+    selected: Boolean,
+    busy: Boolean,
+    manuallyArchived: Boolean,
+    onSelect: () -> Unit,
+    onAction: (BatchAction) -> Unit,
     hasRuntimeAction: (NotificationItemEntity) -> Boolean,
     allowRecoveryAttempt: Boolean,
     showTime: Boolean,
 ) {
-    var launch by remember { mutableStateOf(false) }
-    var showDeleteDialog by remember { mutableStateOf(false) }
-    var deletionSaving by remember { mutableStateOf(false) }
-    var deletionError by remember { mutableStateOf(false) }
-    val coroutineScope = rememberCoroutineScope()
-    var runtimeAvailable by remember(item.itemId, item.lastUpdatedAtEpochMillis) {
-        mutableStateOf(hasRuntimeAction(item))
-    }
-    if (launch) {
-        LaunchedEffect(item.itemId) {
-            val status = onOpen(item)
-            if (status != RuntimeActionStatus.ACCEPTED) runtimeAvailable = false
-            launch = false
-        }
-    }
+    val scope = rememberCoroutineScope()
+    var opening by remember(item.itemId) { mutableStateOf(false) }
+    val runtimeAvailable = hasRuntimeAction(item)
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(enabled = runtimeAvailable || allowRecoveryAttempt) { launch = true }
-            .padding(16.dp),
+        Modifier.fillMaxWidth().combinedClickable(
+            enabled = !busy && !opening,
+            onLongClick = onSelect,
+            onClick = {
+                if (selecting) onSelect()
+                else if (runtimeAvailable || allowRecoveryAttempt) {
+                    opening = true
+                    scope.launch { try { onOpen(item) } finally { opening = false } }
+                }
+            },
+        ).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(5.dp),
     ) {
-        if (showTime) {
-            Text(
-                text = formatTime(item.sortTimeEpochMillis),
-                modifier = Modifier.align(Alignment.End),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.labelMedium,
-            )
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            if (selecting) Checkbox(checked = selected, onCheckedChange = { onSelect() }, enabled = !busy)
+            if (showTime) Text(formatTime(item.sortTimeEpochMillis), style = MaterialTheme.typography.labelMedium)
         }
-        item.title?.let { title ->
-            Text(
-                title,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.titleMedium,
-            )
-        }
-        item.body?.let { body ->
-            Text(
-                body,
-                maxLines = 4,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            notificationActionPrompt(runtimeAvailable, allowRecoveryAttempt)?.let { prompt ->
-                Text(
-                    text = prompt,
-                    modifier = Modifier.weight(1f),
-                    color = MaterialTheme.colorScheme.primary,
-                    style = MaterialTheme.typography.labelSmall,
-                )
+        item.title?.let { Text(it, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium) }
+        item.body?.let { Text(it, maxLines = 4, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium) }
+        if (!selecting) {
+            notificationActionPrompt(runtimeAvailable, allowRecoveryAttempt)?.let {
+                Text(if (opening) "正在尝试打开…" else it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
             }
-            TextButton(
-                onClick = {
-                    deletionError = false
-                    showDeleteDialog = true
-                },
-            ) {
-                Text("删除记录", color = MaterialTheme.colorScheme.error)
+            Row {
+                if (allowRecoveryAttempt) {
+                    if (manuallyArchived) TextButton(onClick = { onAction(BatchAction.RESTORE) }, enabled = !busy) { Text("取消手动归档") }
+                    TextButton(onClick = { onAction(BatchAction.DELETE) }, enabled = !busy) { Text("永久删除", color = MaterialTheme.colorScheme.error) }
+                } else {
+                    TextButton(onClick = { onAction(BatchAction.ARCHIVE) }, enabled = !busy) { Text("归档") }
+                }
             }
-        }
-    }
-    if (showDeleteDialog) {
-        AlertDialog(
-            onDismissRequest = {
-                if (!deletionSaving) showDeleteDialog = false
-            },
-            title = { Text("删除这条通知记录？") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        "这会从本机永久删除这 1 条记录和当前跳转动作，无法恢复。不会停止记录 ${item.sourceName()}；如果来源再次发送或更新，它可能重新出现。",
-                    )
-                    if (deletionError) {
-                        Text(
-                            "删除失败，记录仍保留在本机。",
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    enabled = !deletionSaving,
-                    onClick = {
-                        deletionSaving = true
-                        deletionError = false
-                        coroutineScope.launch {
-                            val deleted = onDelete(item)
-                            deletionSaving = false
-                            deletionError = !deleted
-                            if (deleted) showDeleteDialog = false
-                        }
-                    },
-                ) {
-                    Text(
-                        if (deletionSaving) "删除中…" else "删除 1 条记录",
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    enabled = !deletionSaving,
-                    onClick = { showDeleteDialog = false },
-                ) {
-                    Text("取消")
-                }
-            },
-        )
-    }
-}
-
-@Composable
-private fun HealthRail(confirmed: Boolean?) {
-    val text = when (confirmed) {
-        true -> "蓝色实线：记录时已确认运行"
-        false -> "黄色虚线：该段未确认运行"
-        null -> "当前已加载时间轴的边界；不推断更早区间"
-    }
-    Column(
-        modifier = Modifier
-            .width(18.dp)
-            .fillMaxHeight()
-            .semantics { contentDescription = text },
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Surface(
-            modifier = Modifier.size(12.dp),
-            color = ConfirmedBlue,
-            shape = CircleShape,
-        ) {}
-        Canvas(Modifier.weight(1f).width(4.dp)) {
-            if (confirmed != null) {
-                drawLine(
-                    color = if (confirmed) ConfirmedBlue else UnconfirmedYellow,
-                    start = Offset(size.width / 2f, 0f),
-                    end = Offset(size.width / 2f, size.height),
-                    strokeWidth = size.width,
-                    pathEffect = if (confirmed) null else PathEffect.dashPathEffect(floatArrayOf(8f, 8f)),
-                )
-            }
+            if (allowRecoveryAttempt) Text(
+                if (manuallyArchived) "手动归档" else "当前没有跳转动作",
+                style = MaterialTheme.typography.labelSmall,
+            )
         }
     }
 }
@@ -1064,9 +1020,9 @@ private fun EmptyInbox(isUnavailableArchive: Boolean) {
             )
             Text(
                 if (isUnavailableArchive) {
-                    "当前没有原通知动作的历史会自动出现在这里。"
+                    "手动归档或当前没有跳转动作的通知会出现在这里。"
                 } else {
-                    "收到带原通知动作的新通知后，它会出现在这里；其他历史保留在设置里的当前无跳转动作归档。"
+                    "收到带原通知动作的新通知后，它会出现在这里；其他历史保留在设置里的已归档通知。"
                 },
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodyMedium,
@@ -1317,5 +1273,3 @@ private object SourceIconCache {
 private val TIME_FORMATTER = DateTimeFormatter.ofPattern("MM-dd HH:mm")
 private const val PREFETCH_ITEM_THRESHOLD = 3
 private const val PREFETCH_VIEWPORTS = 2
-private val ConfirmedBlue = Color(0xFF1565C0)
-private val UnconfirmedYellow = Color(0xFFF9A825)
