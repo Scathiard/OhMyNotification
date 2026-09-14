@@ -73,6 +73,17 @@ $testOnlyMarkers = @(
     'OMN_TEST_ONLY_NOTIFICATION',
     'ControlledNotificationSource',
     'notification-fields-v1'
+    'foreignCrossProcessVerified'
+    'independentUpgradeVerified'
+    'SyntheticCarrierService'
+    'ControlledRebootTarget'
+    'durablePublicTargetRebootVerified'
+    'RouteProbeListener'
+    'RouteReplayProbeActivity'
+    'publicCompletionExactTarget'
+    'readOnlyTagReturnsComponentNotTargetExtras'
+    'publicRouteFieldComparison'
+    'unsupportedIconResource'
 )
 
 foreach ($marker in $testOnlyMarkers) {
@@ -85,6 +96,9 @@ foreach ($marker in $testOnlyMarkers) {
 }
 
 $debugOnlyMarkers = @(
+    'UpdateValidationActivity',
+    'update-validation-fixture.json',
+    'update_validation_network',
     'PhaseZeroControlledActionActivity',
     'PhaseZeroNotificationListener',
     'PhaseZeroListenerRebindActivity',

@@ -1,6 +1,7 @@
 package io.github.prince_dulb.ohmynotification.data
 
 import io.github.prince_dulb.ohmynotification.core.model.NotificationObservation
+import io.github.prince_dulb.ohmynotification.core.model.SnapshotCopyWarning
 import io.github.prince_dulb.ohmynotification.core.normalize.NormalizedContent
 
 internal data class NotificationMergeOutcome(
@@ -15,7 +16,26 @@ internal object NotificationItemMerger {
         content: NormalizedContent,
     ): NotificationMergeOutcome {
         val identity = observation.identity
-        val isNew = previous == null || previous.isRemoved
+        val titleFailed = SnapshotCopyWarning.TITLE_COPY_FAILED in observation.copyWarnings
+        val bodyFailed = observation.copyWarnings.any {
+            it != SnapshotCopyWarning.TITLE_COPY_FAILED && it != SnapshotCopyWarning.CAPTURE_TEXT_TRUNCATED
+        }
+        // Never carry content from a removed lifecycle into a newly posted notification.
+        val fallback = previous?.takeUnless { it.isRemoved }
+        val title = if (titleFailed && content.title == null) fallback?.title else content.title
+        val body = if (bodyFailed && content.body == null) fallback?.body else content.body
+        val titleSize = if (title != content.title) fallback!!.titleOriginalCodePoints else content.titleOriginalCodePoints
+        val bodySize = if (body != content.body) fallback!!.bodyOriginalCodePoints else content.bodyOriginalCodePoints
+        val fingerprint = if (title != content.title || body != content.body) {
+            if (previous != null && previous.title == title && previous.body == body) previous.contentFingerprint else null
+        } else content.contentFingerprint
+        val connectionGap = previous != null && (
+            previous.runtimeSessionIdAtLastCapture != observation.runtimeSessionId ||
+                (previous.lastListenerConnectionId != null && previous.lastListenerConnectionId != observation.listenerConnectionId)
+            )
+        val ambiguousReplacement = previous != null && !previous.isRemoved && connectionGap &&
+            (previous.title != title || previous.body != body)
+        val isNew = previous == null || previous.isRemoved || ambiguousReplacement
         val item = if (isNew) {
             NotificationItemEntity(
                 sourcePackage = identity.sourcePackage,
@@ -28,14 +48,14 @@ internal object NotificationItemMerger {
                 lastUpdatedAtEpochMillis = observation.observedAtEpochMillis,
                 sortTimeEpochMillis = observation.observedAtEpochMillis,
                 originalPostTimeEpochMillis = content.originalPostTimeEpochMillis,
-                title = content.title,
-                body = content.body,
+                title = title,
+                body = body,
                 sourceLabelSnapshot = content.sourceLabelSnapshot,
-                contentFingerprint = content.contentFingerprint,
+                contentFingerprint = fingerprint,
                 normalizationWarnings = content.warnings.joinToString(",") { it.name },
                 normalizationStrategyVersion = content.strategyVersion,
-                titleOriginalCodePoints = content.titleOriginalCodePoints,
-                bodyOriginalCodePoints = content.bodyOriginalCodePoints,
+                titleOriginalCodePoints = titleSize,
+                bodyOriginalCodePoints = bodySize,
                 hadContentIntent = observation.actionCapabilities.hasContentIntent,
                 contentIntentCreatorPackage = observation.actionCapabilities.contentIntentCreatorPackage,
                 notificationActionCount = observation.actionCapabilities.notificationActionCount,
@@ -44,6 +64,9 @@ internal object NotificationItemMerger {
                 lastRemovalReason = null,
                 lastCallbackKind = observation.callbackKind.name,
                 runtimeSessionIdAtLastCapture = observation.runtimeSessionId,
+                lastListenerConnectionId = observation.listenerConnectionId,
+                lastObservedPostTimeEpochMillis = observation.postTimeEpochMillis,
+                identityUncertain = ambiguousReplacement,
             )
         } else {
             requireNotNull(previous).copy(
@@ -56,19 +79,21 @@ internal object NotificationItemMerger {
                 sortTimeEpochMillis = previous.sortTimeEpochMillis,
                 originalPostTimeEpochMillis =
                     previous.originalPostTimeEpochMillis ?: content.originalPostTimeEpochMillis,
-                title = content.title,
-                body = content.body,
+                title = title,
+                body = body,
                 sourceLabelSnapshot = content.sourceLabelSnapshot ?: previous.sourceLabelSnapshot,
-                contentFingerprint = content.contentFingerprint,
+                contentFingerprint = fingerprint,
                 normalizationWarnings = content.warnings.joinToString(",") { it.name },
                 normalizationStrategyVersion = content.strategyVersion,
-                titleOriginalCodePoints = content.titleOriginalCodePoints,
-                bodyOriginalCodePoints = content.bodyOriginalCodePoints,
+                titleOriginalCodePoints = titleSize,
+                bodyOriginalCodePoints = bodySize,
                 hadContentIntent = observation.actionCapabilities.hasContentIntent,
                 contentIntentCreatorPackage = observation.actionCapabilities.contentIntentCreatorPackage,
                 notificationActionCount = observation.actionCapabilities.notificationActionCount,
                 lastCallbackKind = observation.callbackKind.name,
                 runtimeSessionIdAtLastCapture = observation.runtimeSessionId,
+                lastListenerConnectionId = observation.listenerConnectionId,
+                lastObservedPostTimeEpochMillis = observation.postTimeEpochMillis,
             )
         }
         return NotificationMergeOutcome(item, isNew)
@@ -100,5 +125,8 @@ internal object NotificationItemMerger {
             previous.notificationActionCount == candidate.notificationActionCount &&
             previous.isRemoved == candidate.isRemoved &&
             previous.removedAtEpochMillis == candidate.removedAtEpochMillis &&
-            previous.lastRemovalReason == candidate.lastRemovalReason
+            previous.lastRemovalReason == candidate.lastRemovalReason &&
+            previous.lastListenerConnectionId == candidate.lastListenerConnectionId &&
+            previous.lastObservedPostTimeEpochMillis == candidate.lastObservedPostTimeEpochMillis &&
+            previous.identityUncertain == candidate.identityUncertain
 }

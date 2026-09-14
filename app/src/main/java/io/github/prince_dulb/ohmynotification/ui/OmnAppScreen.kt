@@ -24,7 +24,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
@@ -40,7 +39,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -64,7 +62,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -73,6 +70,7 @@ import androidx.paging.compose.collectAsLazyPagingItems
 import io.github.prince_dulb.ohmynotification.R
 import io.github.prince_dulb.ohmynotification.capture.ListenerRebindResult
 import io.github.prince_dulb.ohmynotification.capture.ListenerRebindTrigger
+import io.github.prince_dulb.ohmynotification.capture.ListenerRecoveryState
 import io.github.prince_dulb.ohmynotification.capture.RuntimeActionStatus
 import io.github.prince_dulb.ohmynotification.capture.LaunchableSource
 import io.github.prince_dulb.ohmynotification.core.model.AppSettingsSnapshot
@@ -104,6 +102,7 @@ data class AppUiState(
     val listenerConnected: Boolean = false,
     val listenerConnectionObserved: Boolean = false,
     val processingOperational: Boolean = true,
+    val knownCaptureGap: Boolean = false,
     val statusNotificationGranted: Boolean = false,
     val statusNotificationChannelEnabled: Boolean = true,
 )
@@ -120,6 +119,7 @@ internal fun OmnAppScreen(
     onRequestStatusNotification: () -> Unit,
     onOpenStatusChannel: () -> Unit,
     onRequestListenerRebind: (ListenerRebindTrigger) -> ListenerRebindResult,
+    listenerRecovery: kotlinx.coroutines.flow.StateFlow<ListenerRecoveryState>,
     onSetSourceExcluded: suspend (String, Boolean) -> Boolean,
     onSetNotificationTypeRecorded: suspend (NotificationType, Boolean) -> Boolean,
     onSetGroupingWindowMinutes: suspend (Int) -> Boolean,
@@ -128,9 +128,11 @@ internal fun OmnAppScreen(
     onBatchAction: suspend (Set<Long>, Set<AppUserKey>, BatchAction) -> BatchResult,
     onUndoArchive: suspend (io.github.prince_dulb.ohmynotification.data.ArchiveChange) -> Unit,
     onOpenOnboarding: () -> Unit,
+    onExportDiagnostics: () -> Unit,
     updateContent: @Composable () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val recoveryState by listenerRecovery.collectAsStateWithLifecycle()
     val sources by repository.sourceSummaries.collectAsStateWithLifecycle(emptyList())
     val exclusions by repository.excludedSources.collectAsStateWithLifecycle(emptyList())
     val excludedPackages = remember(exclusions) {
@@ -199,17 +201,18 @@ internal fun OmnAppScreen(
     var filterSaving by remember { mutableStateOf(false) }
     var dialog by remember { mutableStateOf<SourceDialog?>(null) }
     var destination by remember { mutableStateOf(AppDestination.INBOX) }
-    var rebindFeedback by remember { mutableStateOf<String?>(null) }
     val expandedDrawers = remember { mutableStateMapOf<Long, Boolean>() }
-    val snackbar = remember { SnackbarHostState() }
+    val snackbar = remember { SnackbarFeedback() }
     val coroutineScope = rememberCoroutineScope()
+    var detailsItem by remember { mutableStateOf<NotificationItemEntity?>(null) }
+    detailsItem?.let { item -> NotificationDetailsDialog(item, repository) { detailsItem = null } }
     val actionView = if (destination == AppDestination.UNAVAILABLE_ARCHIVE) {
         NotificationActionView.UNAVAILABLE_ARCHIVE
     } else {
         NotificationActionView.ACTIONABLE
     }
-    val pagingFlow = remember(viewFilter, actionView, runtimeActionItemIds) {
-        repository.pagedItems(viewFilter, actionView, runtimeActionItemIds)
+    val pagingFlow = remember(viewFilter, actionView) {
+        repository.livePagedItems(viewFilter, actionView)
     }
     val pagingItems = pagingFlow.collectAsLazyPagingItems()
     val loadedItems = pagingItems.itemSnapshotList.items
@@ -225,6 +228,7 @@ internal fun OmnAppScreen(
     var busy by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<Map<Long, AppUserKey>?>(null) }
     var pendingSourceAction by remember { mutableStateOf<Pair<BatchAction, Map<Long, AppUserKey>>?>(null) }
+    var selectionSession by remember { mutableStateOf(0L) }
     fun execute(action: BatchAction, targets: Map<Long, AppUserKey>) {
         if (busy || targets.isEmpty()) return
         busy = true
@@ -242,7 +246,7 @@ internal fun OmnAppScreen(
                 busy = false
             }
             if (result == null) {
-                snackbar.showSnackbar("操作未能完成，请重试")
+                snackbar.showLatestSnackbar("操作未能完成，请重试")
                 return@launch
             }
             val message = when (action) {
@@ -251,11 +255,11 @@ internal fun OmnAppScreen(
                 BatchAction.DELETE -> "已永久删除 ${result.count} 条记录"
                 else -> "已对 ${result.count} 个来源应用执行：${action.label}"
             }
-            val answer = snackbar.showSnackbar(message, actionLabel = result.undo?.let { "撤销" })
+            val answer = snackbar.showLatestSnackbar(message, actionLabel = result.undo?.let { "撤销" })
             if (answer == SnackbarResult.ActionPerformed && result.undo != null) {
                 try { onUndoArchive(result.undo) }
                 catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
-                catch (_: Exception) { snackbar.showSnackbar("撤销失败，请到归档页重试") }
+                catch (_: Exception) { snackbar.showLatestSnackbar("撤销失败，请到归档页重试") }
             }
         }
     }
@@ -267,7 +271,27 @@ internal fun OmnAppScreen(
             else -> execute(action, targets.toMap())
         }
     }
+    val openAndReport: suspend (NotificationItemEntity) -> RuntimeActionStatus = { item ->
+        val status = onOpenNotification(item)
+        coroutineScope.launch {
+            snackbar.showLatestSnackbar(when (status) {
+                RuntimeActionStatus.ACCEPTED -> "已交给原应用打开"
+                RuntimeActionStatus.CANCELED -> "原应用已取消这次跳转"
+                RuntimeActionStatus.NOT_FOUND -> "系统当前没有可重新取得的原通知动作"
+                RuntimeActionStatus.SECURITY_REJECTED -> "系统拒绝了这次跳转"
+            })
+        }
+        status
+    }
+    val selectItem: (NotificationItemEntity) -> Unit = { item ->
+        if (!busy) {
+            selecting = true
+            selected = if (item.itemId in selected) selected - item.itemId
+                else selected + (item.itemId to item.sourceKey())
+        }
+    }
     LaunchedEffect(destination, viewFilter) {
+        selectionSession++
         selecting = false
         selected = emptyMap()
     }
@@ -299,26 +323,19 @@ internal fun OmnAppScreen(
         inboxListState
     }
 
-    LaunchedEffect(state.listenerConnected) {
-        if (state.listenerConnected) rebindFeedback = null
-    }
-
-    LaunchedEffect(actionView, nodes.size, loadedItems.size) {
+    LaunchedEffect(actionView, loadedIds, listState) {
         if (nodes.isEmpty() || loadedItems.isEmpty()) return@LaunchedEffect
+        val indices = loadedIds.withIndex().associate { "notification:${it.value}" to it.index }
         snapshotFlow {
-            val layout = listState.layoutInfo
-            val lastVisible = layout.visibleItemsInfo.lastOrNull()
-            lastVisible != null && shouldPrefetchTimeline(
-                lastVisibleIndex = lastVisible.index,
-                totalItemCount = layout.totalItemsCount,
-                lastVisibleBottom = lastVisible.offset + lastVisible.size,
-                viewportEnd = layout.viewportEndOffset,
-                viewportSize = (layout.viewportEndOffset - layout.viewportStartOffset).coerceAtLeast(0),
-            )
+            listState.layoutInfo.visibleItemsInfo.mapNotNull { indices[it.key] }
         }
             .distinctUntilChanged()
-            .filter { shouldPrefetch -> shouldPrefetch }
-            .collect { pagingItems[loadedItems.lastIndex] }
+            .collect { visible ->
+                // Both edges receive real Paging access hints. Reading snapshots alone cannot
+                // reload pages dropped by maxSize when the user scrolls back towards newer rows.
+                visible.minOrNull()?.takeIf { it < pagingItems.itemCount }?.let { pagingItems[it] }
+                visible.maxOrNull()?.takeIf { it < pagingItems.itemCount }?.let { pagingItems[it] }
+            }
     }
 
     BackHandler(enabled = destination != AppDestination.INBOX) {
@@ -337,6 +354,7 @@ internal fun OmnAppScreen(
                 onBack = { destination = AppDestination.INBOX },
                 unavailableArchiveCount = archiveCount,
                 onOpenOnboarding = onOpenOnboarding,
+                onExportDiagnostics = onExportDiagnostics,
                 updateContent = updateContent,
                 onOpenUnavailableArchive = { destination = AppDestination.UNAVAILABLE_ARCHIVE },
                 onManageExcludedApps = { dialog = SourceDialog.EXCLUDE },
@@ -357,11 +375,15 @@ internal fun OmnAppScreen(
                     val snapshotFilter = viewFilter
                     val snapshotView = actionView
                     val snapshotActions = runtimeActionItemIds.toSet()
+                    val snapshotBoundary = repository.selectionBoundary()
+                    val snapshotSession = selectionSession
                     coroutineScope.launch {
                         try {
-                            selected = repository.selectionSnapshot(snapshotFilter, snapshotView, snapshotActions)
+                            val result = repository.selectionSnapshot(snapshotFilter, snapshotView, snapshotActions, snapshotBoundary)
                                 .associate { it.itemId to AppUserKey(it.sourceUserRef, it.sourcePackage) }
-                        } catch (_: Exception) { snackbar.showSnackbar("全选失败，请重试") }
+                            if (snapshotSession == selectionSession) selected = result
+                        } catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
+                        catch (_: Exception) { snackbar.showLatestSnackbar("全选失败，请重试") }
                         finally { busy = false }
                     }
                 },
@@ -376,9 +398,9 @@ internal fun OmnAppScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 if (!selecting) item(key = "header") {
-                    if (!selecting) TextButton(onClick = { selecting = true }) { Text("批量操作") }
                     if (destination == AppDestination.UNAVAILABLE_ARCHIVE) {
                         UnavailableArchiveHeader(
+                            onStartSelection = { selecting = true },
                             selectedCount = viewFilter.includedSources.size,
                             hiddenCount = viewFilter.excludedSources.size,
                             onBack = { destination = AppDestination.INBOX },
@@ -390,6 +412,7 @@ internal fun OmnAppScreen(
                         )
                     } else {
                         InboxHeader(
+                            onStartSelection = { selecting = true },
                             state = state,
                             selectedCount = viewFilter.includedSources.size,
                             hiddenCount = viewFilter.excludedSources.size,
@@ -402,12 +425,12 @@ internal fun OmnAppScreen(
                             onOpenNotificationAccess = onOpenNotificationAccess,
                             onRequestStatusNotification = onRequestStatusNotification,
                             onOpenStatusChannel = onOpenStatusChannel,
-                            rebindFeedback = rebindFeedback,
+                            recoveryState = recoveryState,
                             onRequestListenerRebind = {
                                 val result = onRequestListenerRebind(ListenerRebindTrigger.USER)
-                                val message = result.userMessage()
-                                rebindFeedback = message
-                                coroutineScope.launch { snackbar.showSnackbar(message) }
+                                if (result != ListenerRebindResult.REQUESTED && result != ListenerRebindResult.IN_PROGRESS) {
+                                    coroutineScope.launch { snackbar.showLatestSnackbar(result.userMessage()) }
+                                }
                             },
                         )
                     }
@@ -426,7 +449,8 @@ internal fun OmnAppScreen(
                     }
                 }
 
-                itemsIndexed(nodes, key = { _, node -> node.key }) { _, node ->
+                nodes.forEach { node ->
+                  item(key = node.key, contentType = "source-header") {
                     TimelineNodeCard(
                         node = node,
                         expanded = drawerExpanded(expandedDrawers, node.anchor.itemId),
@@ -434,36 +458,13 @@ internal fun OmnAppScreen(
                             val itemId = node.anchor.itemId
                             expandedDrawers[itemId] = !drawerExpanded(expandedDrawers, itemId)
                         },
-                        onOpen = { item ->
-                            val status = onOpenNotification(item)
-                            val message = when (status) {
-                                RuntimeActionStatus.ACCEPTED -> "已交给原应用打开"
-                                RuntimeActionStatus.CANCELED -> "原应用已取消这次跳转"
-                                RuntimeActionStatus.NOT_FOUND -> "系统当前没有可重新取得的原通知动作"
-                                RuntimeActionStatus.SECURITY_REJECTED -> "系统拒绝了这次跳转"
-                            }
-                            snackbar.showSnackbar(message)
-                            status
-                        },
                         selecting = selecting,
-                        selectedIds = selected.keys,
                         busy = busy,
-                        manualArchiveIds = manualArchiveIds.toSet(),
-                        onSelect = { item ->
-                            if (!busy) {
-                                selecting = true
-                                selected = if (item.itemId in selected) selected - item.itemId
-                                    else selected + (item.itemId to item.sourceKey())
-                            }
-                        },
-                        onEntryAction = { item, action -> requestAction(action, mapOf(item.itemId to item.sourceKey())) },
-                        hasRuntimeAction = repository::hasRuntimeAction,
-                        allowRecoveryAttempt = actionView == NotificationActionView.UNAVAILABLE_ARCHIVE,
                         excludedPackages = excludedPackages,
                         onSetSourceExcluded = { item, excluded ->
                             val saved = onSetSourceExcluded(item.sourcePackage, excluded)
                             coroutineScope.launch {
-                                snackbar.showSnackbar(
+                                snackbar.showLatestSnackbar(
                                     if (saved && excluded) {
                                         "已不再记录 ${item.sourceName()} 的新通知"
                                     } else if (saved) {
@@ -480,7 +481,7 @@ internal fun OmnAppScreen(
                                 val saved = onApplyInboxViewFilter(
                                     viewFilter.only(item.sourceKey()),
                                 )
-                                snackbar.showSnackbar(
+                                snackbar.showLatestSnackbar(
                                     if (saved) "现在只查看 ${item.sourceName()}"
                                     else "查看范围保存失败，仍使用原筛选",
                                 )
@@ -491,13 +492,47 @@ internal fun OmnAppScreen(
                                 val saved = onApplyInboxViewFilter(
                                     viewFilter.without(item.sourceKey()),
                                 )
-                                snackbar.showSnackbar(
+                                snackbar.showLatestSnackbar(
                                     if (saved) "已不查看 ${item.sourceName()}"
                                     else "查看范围保存失败，仍使用原筛选",
                                 )
                             }
                         },
                     )
+                  }
+                  val expanded = drawerExpanded(expandedDrawers, node.anchor.itemId)
+                  val members = if (expanded) node.members else listOf(node.anchor)
+                  items(members, key = { "notification:${it.itemId}" }, contentType = { "notification" }) { item ->
+                    Card(Modifier.fillMaxWidth().padding(start = 12.dp)) {
+                        NotificationEntry(
+                            item = item,
+                            onOpen = openAndReport,
+                            selecting = selecting,
+                            selected = item.itemId in selected,
+                            busy = busy,
+                            manuallyArchived = item.itemId in manualArchiveIds,
+                            onSelect = { selectItem(item) },
+                            onAction = { requestAction(it, mapOf(item.itemId to item.sourceKey())) },
+                            onDetails = { detailsItem = item },
+                            hasRuntimeAction = repository::hasRuntimeAction,
+                            allowRecoveryAttempt = actionView == NotificationActionView.UNAVAILABLE_ARCHIVE,
+                            showTime = true,
+                        )
+                    }
+                  }
+                  if (!expanded && node == nodes.last() && !pagingItems.loadState.append.endOfPaginationReached) {
+                    item(key = "collapsed-load-earlier") {
+                        TextButton(onClick = { if (pagingItems.itemCount > 0) pagingItems[pagingItems.itemCount - 1] }) {
+                            Text("载入更早的记录")
+                        }
+                    }
+                  }
+                }
+
+                if (pagingItems.loadState.prepend is LoadState.Error) {
+                    item(key = "prepend-error") {
+                        PagingLoadError("较新的记录载入失败。", pagingItems::retry)
+                    }
                 }
 
                 if (pagingItems.loadState.append is LoadState.Loading) {
@@ -520,7 +555,7 @@ internal fun OmnAppScreen(
             }
           }
             SnackbarHost(
-                hostState = snackbar,
+                hostState = snackbar.hostState,
                 modifier = Modifier.align(Alignment.BottomCenter).safeDrawingPadding(),
             )
         }
@@ -550,7 +585,7 @@ internal fun OmnAppScreen(
                             viewFilterFromVisibleSelection(viewFilter, filterDraft, filterChoices),
                         )
                         filterSaving = false
-                        if (saved) dialog = null else snackbar.showSnackbar("查看范围保存失败，仍使用原筛选")
+                        if (saved) dialog = null else snackbar.showLatestSnackbar("查看范围保存失败，仍使用原筛选")
                     }
                 }
             },
@@ -569,7 +604,7 @@ internal fun OmnAppScreen(
             onToggle = { source, excluded ->
                 coroutineScope.launch {
                     if (!onSetSourceExcluded(source.sourcePackage, excluded)) {
-                        snackbar.showSnackbar("未能保存设置，监控范围没有改变")
+                        snackbar.showLatestSnackbar("未能保存设置，监控范围没有改变")
                     }
                 }
             },
@@ -583,6 +618,7 @@ internal fun OmnAppScreen(
 
 @Composable
 private fun InboxHeader(
+    onStartSelection: () -> Unit,
     state: AppUiState,
     selectedCount: Int,
     hiddenCount: Int,
@@ -591,7 +627,7 @@ private fun InboxHeader(
     onOpenNotificationAccess: () -> Unit,
     onRequestStatusNotification: () -> Unit,
     onOpenStatusChannel: () -> Unit,
-    rebindFeedback: String?,
+    recoveryState: ListenerRecoveryState,
     onRequestListenerRebind: () -> Unit,
 ) {
     val presentation = StatusPresentationDeriver.derive(
@@ -599,10 +635,12 @@ private fun InboxHeader(
         connectionObserved = state.listenerConnectionObserved,
         listenerConnected = state.listenerConnected,
         processingOperational = state.processingOperational,
+        knownCaptureGap = state.knownCaptureGap,
     )
     val healthy = presentation == StatusPresentationState.LISTENING
     val healthTitle = when (presentation) {
         StatusPresentationState.LISTENING -> "● 正在记录通知"
+        StatusPresentationState.KNOWN_CAPTURE_GAP -> "◆ 正在记录，但曾出现未恢复缺口"
         StatusPresentationState.PROCESSING_INTERRUPTED -> "◆ 记录链路发生故障"
         StatusPresentationState.WAITING_FOR_CONNECTION -> "◆ 已授权，等待系统连接"
         StatusPresentationState.LISTENER_INTERRUPTED -> "◆ 监听连接已中断"
@@ -610,20 +648,24 @@ private fun InboxHeader(
     }
     val listenerDetail = when (presentation) {
         StatusPresentationState.LISTENING -> "已连接"
+        StatusPresentationState.KNOWN_CAPTURE_GAP -> "有漏记风险"
         StatusPresentationState.PROCESSING_INTERRUPTED -> "处理故障"
         StatusPresentationState.WAITING_FOR_CONNECTION -> "等待连接"
         StatusPresentationState.LISTENER_INTERRUPTED -> "已中断"
         StatusPresentationState.ACCESS_REQUIRED -> "未授权"
     }
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(
-                text = stringResource(R.string.inbox_eyebrow),
-                color = MaterialTheme.colorScheme.primary,
-                fontWeight = FontWeight.Bold,
-                style = MaterialTheme.typography.labelLarge,
-            )
-            Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = stringResource(R.string.inbox_eyebrow),
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
+            }
+            PageActionsMenu(onStartSelection = onStartSelection)
         }
         Card(
             colors = CardDefaults.cardColors(
@@ -654,20 +696,26 @@ private fun InboxHeader(
                 Text(stringResource(R.string.action_grant_notification_access))
             }
         }
-        if (state.listenerAccessGranted && !state.listenerConnected) {
-            Button(onClick = onRequestListenerRebind, modifier = Modifier.fillMaxWidth()) {
-                Text("请求重新连接监听")
+        if (state.knownCaptureGap) {
+            Text("曾发生采集或补扫失败。恢复处理不代表缺失通知已找回；重启应用也不会消除这条提醒。", style = MaterialTheme.typography.bodySmall)
+            TextButton(onClick = { io.github.prince_dulb.ohmynotification.capture.ListenerRuntimeState.acknowledgeGap() }) {
+                Text("已了解，清除此提醒")
             }
-            rebindFeedback?.let { message ->
-                Text(
-                    text = message,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                )
+        }
+        if (state.listenerAccessGranted && (!state.listenerConnected || recoveryState.running)) {
+            Button(
+                onClick = onRequestListenerRebind,
+                enabled = !recoveryState.running,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(if (recoveryState.running) "正在恢复监听…" else "请求重新连接监听")
             }
             OutlinedButton(onClick = onOpenNotificationAccess, modifier = Modifier.fillMaxWidth()) {
                 Text("打开通知使用权设置")
             }
+        }
+        recoveryState.message()?.let { message ->
+            Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         }
         if (!state.statusNotificationGranted) {
             Button(onClick = onRequestStatusNotification, modifier = Modifier.fillMaxWidth()) {
@@ -692,6 +740,7 @@ private fun InboxHeader(
 
 @Composable
 private fun UnavailableArchiveHeader(
+    onStartSelection: () -> Unit,
     selectedCount: Int,
     hiddenCount: Int,
     onBack: () -> Unit,
@@ -699,11 +748,15 @@ private fun UnavailableArchiveHeader(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         TextButton(onClick = onBack) { Text("返回可跳转通知") }
-        Text(
-            text = "已归档通知",
-            style = MaterialTheme.typography.headlineMedium,
-            fontWeight = FontWeight.Bold,
-        )
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "已归档通知",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+            )
+            PageActionsMenu(onStartSelection = onStartSelection)
+        }
         Text(
             text = "这些记录仍保存在本机。点按其中一条会重扫一次系统当前仍存在的通知；若重新取得同一条的动作就尝试打开，但不保证成功。",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -716,19 +769,34 @@ private fun UnavailableArchiveHeader(
 }
 
 @Composable
+private fun PageActionsMenu(onStartSelection: () -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        IconButton(
+            onClick = { expanded = true },
+            modifier = Modifier.semantics { contentDescription = "页面操作" },
+        ) {
+            Text("⋮", style = MaterialTheme.typography.titleLarge)
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(
+                text = { Text("批量操作") },
+                onClick = {
+                    expanded = false
+                    onStartSelection()
+                },
+            )
+        }
+    }
+}
+
+@Composable
 private fun TimelineNodeCard(
     node: TimelineNode,
     expanded: Boolean,
     onToggle: () -> Unit,
-    onOpen: suspend (NotificationItemEntity) -> RuntimeActionStatus,
     selecting: Boolean,
-    selectedIds: Set<Long>,
     busy: Boolean,
-    manualArchiveIds: Set<Long>,
-    onSelect: (NotificationItemEntity) -> Unit,
-    onEntryAction: (NotificationItemEntity, BatchAction) -> Unit,
-    hasRuntimeAction: (NotificationItemEntity) -> Boolean,
-    allowRecoveryAttempt: Boolean,
     excludedPackages: Set<String>,
     onSetSourceExcluded: suspend (NotificationItemEntity, Boolean) -> Boolean,
     onOnlyViewSource: (NotificationItemEntity) -> Unit,
@@ -820,28 +888,6 @@ private fun TimelineNodeCard(
                         }
                     }
                 }
-                HorizontalDivider()
-                val displayedMembers = if (node.members.size == 1 || expanded) {
-                    node.members
-                } else {
-                    listOf(source)
-                }
-                displayedMembers.forEachIndexed { index, item ->
-                    if (index > 0) HorizontalDivider()
-                    NotificationEntry(
-                        item = item,
-                        onOpen = onOpen,
-                        selecting = selecting,
-                        selected = item.itemId in selectedIds,
-                        busy = busy,
-                        manuallyArchived = item.itemId in manualArchiveIds,
-                        onSelect = { onSelect(item) },
-                        onAction = { onEntryAction(item, it) },
-                        hasRuntimeAction = hasRuntimeAction,
-                        allowRecoveryAttempt = allowRecoveryAttempt,
-                        showTime = node.members.size > 1,
-                    )
-                }
             }
         }
     }
@@ -922,12 +968,14 @@ private fun NotificationEntry(
     manuallyArchived: Boolean,
     onSelect: () -> Unit,
     onAction: (BatchAction) -> Unit,
+    onDetails: () -> Unit,
     hasRuntimeAction: (NotificationItemEntity) -> Boolean,
     allowRecoveryAttempt: Boolean,
     showTime: Boolean,
 ) {
     val scope = rememberCoroutineScope()
     var opening by remember(item.itemId) { mutableStateOf(false) }
+    var actionMenuExpanded by remember(item.itemId, selecting, busy, opening) { mutableStateOf(false) }
     val runtimeAvailable = hasRuntimeAction(item)
     Column(
         Modifier.fillMaxWidth().combinedClickable(
@@ -945,21 +993,50 @@ private fun NotificationEntry(
     ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             if (selecting) Checkbox(checked = selected, onCheckedChange = { onSelect() }, enabled = !busy)
-            if (showTime) Text(formatTime(item.sortTimeEpochMillis), style = MaterialTheme.typography.labelMedium)
+            Box(Modifier.weight(1f)) {
+                if (showTime) Text(formatTime(item.sortTimeEpochMillis), style = MaterialTheme.typography.labelMedium)
+            }
+            if (!selecting) {
+                Box {
+                    IconButton(
+                        onClick = { actionMenuExpanded = true },
+                        enabled = !busy && !opening,
+                        modifier = Modifier.semantics { contentDescription = "此通知的更多操作" },
+                    ) {
+                        Text("⋮", style = MaterialTheme.typography.titleLarge)
+                    }
+                    DropdownMenu(
+                        expanded = actionMenuExpanded,
+                        onDismissRequest = { actionMenuExpanded = false },
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("更新历史") },
+                            onClick = { actionMenuExpanded = false; onDetails() },
+                        )
+                        if (allowRecoveryAttempt) {
+                            if (manuallyArchived) DropdownMenuItem(
+                                text = { Text("取消手动归档") },
+                                onClick = { actionMenuExpanded = false; onAction(BatchAction.RESTORE) },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("永久删除", color = MaterialTheme.colorScheme.error) },
+                                onClick = { actionMenuExpanded = false; onAction(BatchAction.DELETE) },
+                            )
+                        } else {
+                            DropdownMenuItem(
+                                text = { Text("归档") },
+                                onClick = { actionMenuExpanded = false; onAction(BatchAction.ARCHIVE) },
+                            )
+                        }
+                    }
+                }
+            }
         }
-        item.title?.let { Text(it, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium) }
-        item.body?.let { Text(it, maxLines = 4, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium) }
+        item.title?.let { Text(it, style = MaterialTheme.typography.titleMedium) }
+        item.body?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
         if (!selecting) {
             notificationActionPrompt(runtimeAvailable, allowRecoveryAttempt)?.let {
                 Text(if (opening) "正在尝试打开…" else it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
-            }
-            Row {
-                if (allowRecoveryAttempt) {
-                    if (manuallyArchived) TextButton(onClick = { onAction(BatchAction.RESTORE) }, enabled = !busy) { Text("取消手动归档") }
-                    TextButton(onClick = { onAction(BatchAction.DELETE) }, enabled = !busy) { Text("永久删除", color = MaterialTheme.colorScheme.error) }
-                } else {
-                    TextButton(onClick = { onAction(BatchAction.ARCHIVE) }, enabled = !busy) { Text("归档") }
-                }
             }
             if (allowRecoveryAttempt) Text(
                 if (manuallyArchived) "手动归档" else "当前没有跳转动作",
@@ -1233,11 +1310,24 @@ internal fun shouldPrefetchTimeline(
 private fun Boolean.status(): String = if (this) "正常" else "不可用"
 
 private fun ListenerRebindResult.userMessage(): String = when (this) {
-    ListenerRebindResult.REQUESTED -> "已请求系统连接；状态变为“正在记录通知”才算成功"
+    ListenerRebindResult.REQUESTED -> "正在尝试恢复监听"
+    ListenerRebindResult.IN_PROGRESS -> "正在恢复监听，请稍候"
     ListenerRebindResult.ALREADY_CONNECTED -> "监听已经连接"
     ListenerRebindResult.ACCESS_REQUIRED -> "请先授予通知使用权"
     ListenerRebindResult.COOLDOWN_OR_AUTOMATIC_LIMIT -> "操作太快，请稍等一秒再试"
     ListenerRebindResult.PLATFORM_REJECTED -> "系统未接受重连请求"
+}
+
+private fun ListenerRecoveryState.message(): String? = when (this) {
+    ListenerRecoveryState.IDLE -> null
+    ListenerRecoveryState.WAITING -> "正在等待系统连接并确认记录状态…"
+    ListenerRecoveryState.RESETTING -> "普通重连尚未恢复，正在重新建立监听绑定…"
+    ListenerRecoveryState.WAITING_AFTER_RESET -> "已重新请求绑定，正在确认是否恢复…"
+    ListenerRecoveryState.RECOVERED -> "监听已恢复。恢复连接不代表断开期间的通知已全部找回。"
+    ListenerRecoveryState.TIMED_OUT -> "本次恢复超时，监听尚未连接。可以重试，或打开通知使用权设置检查。"
+    ListenerRecoveryState.ACCESS_REQUIRED -> "通知使用权未开启，无法恢复监听。"
+    ListenerRecoveryState.PLATFORM_REJECTED -> "系统未接受本次恢复操作，请检查通知使用权后重试。"
+    ListenerRecoveryState.PROCESSING_FAILED -> "监听已连接，但记录处理尚未恢复。请查看上方故障状态。"
 }
 
 private fun formatTime(epochMillis: Long): String = TIME_FORMATTER.format(

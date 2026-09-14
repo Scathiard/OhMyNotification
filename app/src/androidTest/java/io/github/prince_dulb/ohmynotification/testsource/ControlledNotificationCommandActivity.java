@@ -140,6 +140,21 @@ public final class ControlledNotificationCommandActivity extends Activity {
                 "omn.synthetic.target_token",
                 targetToken == null ? "OMN_SYNTHETIC_NO_ACTION" : targetToken
         );
+        if (getIntent().getBooleanExtra("omn_reboot_public", false)) {
+            if (!("ranchu".equals(android.os.Build.HARDWARE) || "goldfish".equals(android.os.Build.HARDWARE))) {
+                throw new SecurityException("Reboot route fixture is emulator-only");
+            }
+            String nonce = "OMN_SYNTHETIC_REBOOT_" + java.util.UUID.randomUUID();
+            targetIntent.setClassName(getPackageName(),
+                    "io.github.prince_dulb.ohmynotification.testsource.ControlledRebootTarget");
+            targetIntent.setData(android.net.Uri.parse("omn-synthetic://reboot/" + nonce));
+            targetIntent.putExtra("omn.synthetic.target_token", nonce);
+            Properties truth = new Properties();
+            truth.setProperty("target_token", nonce);
+            try (OutputStream output = openFileOutput("durable-route-source.properties", MODE_PRIVATE)) {
+                truth.store(output, null);
+            }
+        }
         PendingIntent target = PendingIntent.getActivity(
                 this,
                 REQUEST_CODE,
@@ -149,6 +164,16 @@ public final class ControlledNotificationCommandActivity extends Activity {
 
         Bundle syntheticExtras = new Bundle();
         syntheticExtras.putLong(EXTRA_FIXTURE_POSTED_AT, fixture.getLong("postedAtEpochMillis"));
+        String publicFieldFixture = getIntent().getStringExtra("omn_public_route_fixture");
+        if (publicFieldFixture != null) {
+            if (!getIntent().getBooleanExtra("omn_reboot_public", false)
+                    || !("ranchu".equals(android.os.Build.HARDWARE) || "goldfish".equals(android.os.Build.HARDWARE)))
+                throw new SecurityException("Public route fixture is emulator-only");
+            if (!"exact".equals(publicFieldFixture) && !"decoy".equals(publicFieldFixture))
+                throw new IllegalArgumentException("Unknown public route fixture");
+            syntheticExtras.putString("omn.synthetic.public_route", "exact".equals(publicFieldFixture)
+                    ? targetIntent.toUri(Intent.URI_INTENT_SCHEME) : "omn-synthetic://unrelated/other");
+        }
         Notification.Builder builder = new Notification.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.stat_notify_more)
                 .setContentTitle(displayTitle)

@@ -54,7 +54,7 @@ class StatusNotificationController(private val context: Context) {
     ) {
         connectionObserved = true
         connected = isConnected
-        if (isConnected) processingOperational = true
+        processingOperational = ListenerRuntimeState.isProcessingOperational()
         updateSnapshot(currentRecordCount, latestItem)
         schedule(immediate = true)
     }
@@ -87,10 +87,10 @@ class StatusNotificationController(private val context: Context) {
 
     private fun updateSnapshot(currentRecordCount: Long?, latestItem: NotificationItemEntity?) {
         if (currentRecordCount != null) recordCount = currentRecordCount
-        if (latestItem != null) {
-            latestSource = latestItem.sourceLabelSnapshot ?: latestItem.sourcePackage
-            latestTitle = latestItem.title
-            latestEventTimeEpochMillis = latestItem.firstReceivedAtEpochMillis
+        if (latestItem != null || currentRecordCount == 0L) {
+            latestSource = latestItem?.sourceLabelSnapshot ?: latestItem?.sourcePackage
+            latestTitle = latestItem?.title
+            latestEventTimeEpochMillis = latestItem?.firstReceivedAtEpochMillis
         }
     }
 
@@ -142,10 +142,12 @@ class StatusNotificationController(private val context: Context) {
             connectionObserved = connectionObserved,
             listenerConnected = connected,
             processingOperational = processingOperational,
+            knownCaptureGap = ListenerRuntimeState.hasKnownGap(),
         )
         val source = latestSource
         val privateTitle = when (presentation) {
             StatusPresentationState.LISTENING -> context.getString(R.string.status_title_connected)
+            StatusPresentationState.KNOWN_CAPTURE_GAP -> "正在记录 · 曾出现未恢复缺口"
             StatusPresentationState.PROCESSING_INTERRUPTED ->
                 context.getString(R.string.status_title_processing_interrupted)
             StatusPresentationState.WAITING_FOR_CONNECTION ->
@@ -156,6 +158,7 @@ class StatusNotificationController(private val context: Context) {
         }
         val summaryText = when (presentation) {
             StatusPresentationState.LISTENING -> context.getString(R.string.status_connected, recordCount)
+            StatusPresentationState.KNOWN_CAPTURE_GAP -> "已保存 $recordCount 条；此前部分通知可能漏记，请打开应用查看"
             StatusPresentationState.PROCESSING_INTERRUPTED ->
                 context.getString(R.string.status_processing_interrupted, recordCount)
             StatusPresentationState.WAITING_FOR_CONNECTION -> context.getString(R.string.status_waiting_for_connection)

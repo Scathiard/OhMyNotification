@@ -8,6 +8,8 @@ import android.content.IntentFilter
 import android.net.Uri
 import android.os.PowerManager
 import android.widget.Toast
+import io.github.prince_dulb.ohmynotification.capture.ListenerDiagnostics
+import io.github.prince_dulb.ohmynotification.capture.ListenerDiagnosticEvent
 import io.github.prince_dulb.ohmynotification.ui.OnboardingScreen
 import io.github.prince_dulb.ohmynotification.ui.UpdateCard
 import io.github.prince_dulb.ohmynotification.ui.BatchAction
@@ -27,6 +29,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import io.github.prince_dulb.ohmynotification.capture.ListenerRebindResult
@@ -46,9 +50,24 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-class MainActivity : ComponentActivity() {
+open class MainActivity : ComponentActivity() {
+    private val diagnosticExport = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+        if (uri != null) lifecycleScope.launch {
+            val saved = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                val report = ListenerDiagnostics.export() ?: return@withContext false
+                runCatching {
+                    contentResolver.openOutputStream(uri, "wt")?.use {
+                        it.write(report.toByteArray(Charsets.UTF_8))
+                    } ?: error("No output stream")
+                    true
+                }.getOrDefault(false)
+            }
+            Toast.makeText(this@MainActivity, if (saved) "诊断日志已保存" else "日志保存失败，请重试", Toast.LENGTH_LONG).show()
+        }
+    }
     private val onboardingVisible = mutableStateOf(false)
-    private val updater by lazy { AppUpdater(this) }
+    private val updater by lazy { createUpdater() }
+    protected open fun createUpdater(): AppUpdater = AppUpdater(this)
     private var verifyingInstall = false
     private val downloadReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -71,10 +90,7 @@ class MainActivity : ComponentActivity() {
         if (granted) {
             val graph = (application as OmnApplication).graph
             graph.serialScope.launch {
-                graph.statusNotificationController.onExternalStateChanged(
-                    currentRecordCount = graph.repository.currentItemCount(),
-                    latestItem = graph.repository.latestItem(),
-                )
+                refreshExternalSummary()
             }
         }
     }
@@ -85,8 +101,17 @@ class MainActivity : ComponentActivity() {
         onboardingVisible.value = !getSharedPreferences("omn-onboarding", MODE_PRIVATE).getBoolean("v1.1-completed", false)
         refreshUiState()
         setContent {
+            val app = application as OmnApplication
+            val storageReady by app.storageReady.collectAsStateWithLifecycle()
             OhMyNotificationTheme {
-                if (onboardingVisible.value) OnboardingScreen(
+                if (!storageReady) io.github.prince_dulb.ohmynotification.ui.StorageFailureScreen {
+                    lifecycleScope.launch {
+                        if (app.retryStorage()) {
+                            OmnNotificationListenerService.requestActiveNotificationRecovery()
+                            refreshUiState()
+                        }
+                    }
+                } else if (onboardingVisible.value) OnboardingScreen(
                     state = uiState.value,
                     onAccess = ::openNotificationAccessSettings,
                     onNotifications = {
@@ -117,6 +142,7 @@ class MainActivity : ComponentActivity() {
                     onRequestStatusNotification = ::requestStatusNotificationPermission,
                     onOpenStatusChannel = ::openStatusNotificationChannel,
                     onRequestListenerRebind = ::requestListenerRebind,
+                    listenerRecovery = (application as OmnApplication).graph.listenerRebindController.recoveryState,
                     onSetSourceExcluded = ::setSourceExcluded,
                     onSetNotificationTypeRecorded =
                         (application as OmnApplication).graph.appSettingsStore::setNotificationTypeRecorded,
@@ -134,6 +160,12 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     onOpenOnboarding = { onboardingVisible.value = true },
+                    onExportDiagnostics = {
+                        try { diagnosticExport.launch("OMN-listener-diagnostics.txt") }
+                        catch (_: RuntimeException) {
+                            Toast.makeText(this@MainActivity, "无法打开文件保存界面", Toast.LENGTH_LONG).show()
+                        }
+                    },
                     updateContent = {
                         UpdateCard(updater, ::installUpdate) {
                             openSystemSettings(Intent(Intent.ACTION_VIEW, Uri.parse(UpdatePolicy.RELEASES_URL)))
@@ -146,6 +178,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        ListenerDiagnostics.record(ListenerDiagnosticEvent.UI_START)
         registerReceiver(downloadReceiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE), RECEIVER_EXPORTED)
         ListenerRuntimeState.addListener(connectionListener)
         refreshUiState()
@@ -165,6 +198,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        ListenerDiagnostics.record(ListenerDiagnosticEvent.UI_STOP)
         unregisterReceiver(downloadReceiver)
         automaticRebindJob?.cancel()
         automaticRebindJob = null
@@ -175,6 +209,7 @@ class MainActivity : ComponentActivity() {
     private fun refreshUiState() {
         val notificationManager = getSystemService(NotificationManager::class.java)
         val graph = (application as OmnApplication).graph
+        graph.listenerRebindController.refreshRecoveryState()
         uiState.value = AppUiState(
             batteryUnrestricted = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName),
             listenerAccessGranted = notificationManager.isNotificationListenerAccessGranted(
@@ -183,17 +218,30 @@ class MainActivity : ComponentActivity() {
             listenerConnected = ListenerRuntimeState.isConnected(),
             listenerConnectionObserved = ListenerRuntimeState.hasObservedConnectionState(),
             processingOperational = ListenerRuntimeState.isProcessingOperational(),
+            knownCaptureGap = ListenerRuntimeState.hasKnownGap(),
             statusNotificationGranted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
                 PackageManager.PERMISSION_GRANTED,
             statusNotificationChannelEnabled =
                 graph.statusNotificationController.isChannelEnabled(),
         )
         graph.serialScope.launch {
-            graph.statusNotificationController.onExternalStateChanged(
-                currentRecordCount = graph.repository.currentItemCount(),
-                latestItem = graph.repository.latestItem(),
-            )
+            refreshExternalSummary()
         }
+    }
+
+    private suspend fun refreshExternalSummary() {
+        val app = application as OmnApplication
+        val graph = app.graph
+        if (!app.storageReady.value) {
+            graph.statusNotificationController.onProcessingHealthChanged(false, ListenerRuntimeState.isConnected())
+            return
+        }
+        try {
+            graph.repository.publishSummary { count, latest ->
+                graph.statusNotificationController.onExternalStateChanged(count, latest)
+            }
+        } catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
+        catch (_: Exception) { app.reportStorageFailure() }
     }
 
     private fun openNotificationAccessSettings() {
@@ -206,7 +254,9 @@ class MainActivity : ComponentActivity() {
         try {
             startActivity(detailIntent)
         } catch (_: ActivityNotFoundException) {
-            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            openSystemSettings(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        } catch (_: SecurityException) {
+            openSystemSettings(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }
     }
 
@@ -215,7 +265,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openStatusNotificationChannel() {
-        startActivity(
+        openSystemSettings(
             Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
                 putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
                 putExtra(
@@ -267,10 +317,7 @@ class MainActivity : ComponentActivity() {
 
     private suspend fun refreshSummary() {
         val graph = (application as OmnApplication).graph
-        graph.statusNotificationController.onItemDeleted(
-            currentRecordCount = graph.repository.currentItemCount(),
-            latestItem = graph.repository.latestItem(),
-        )
+        graph.repository.publishSummary(graph.statusNotificationController::onItemDeleted)
     }
 
     private suspend fun performBatch(ids: Set<Long>, sources: Set<AppUserKey>, action: BatchAction): BatchResult = serialMutation {

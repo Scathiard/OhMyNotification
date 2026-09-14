@@ -44,6 +44,9 @@ data class NotificationItemEntity(
     val lastRemovalReason: Int?,
     val lastCallbackKind: String,
     val runtimeSessionIdAtLastCapture: String,
+    val lastListenerConnectionId: String? = null,
+    val lastObservedPostTimeEpochMillis: Long? = null,
+    @androidx.room.ColumnInfo(defaultValue = "0") val identityUncertain: Boolean = false,
 )
 
 @Entity(
@@ -95,4 +98,27 @@ data class NotificationSelectionRow(
     val itemId: Long,
     val sourcePackage: String,
     val sourceUserRef: String,
+)
+
+/** Previous visible facts, retained before an update can replace the current projection. */
+@Entity(tableName = "notification_revisions", indices = [Index(value = ["itemId", "revisionId"])])
+data class NotificationRevisionEntity(
+    @PrimaryKey(autoGenerate = true) val revisionId: Long = 0,
+    val itemId: Long,
+    val recordedAtEpochMillis: Long,
+    val title: String?,
+    val body: String?,
+    val originalPostTimeEpochMillis: Long?,
+    val contentFingerprint: String?,
+    val reason: String,
+)
+
+/** Only validated explicit targets; never serialized framework tokens or guessed routes. */
+@Entity(tableName = "notification_targets")
+data class NotificationTargetEntity(
+    @PrimaryKey val itemId: Long,
+    val sourcePackage: String,
+    val uri: String,
+    val provenance: String,
+    val savedAtEpochMillis: Long,
 )

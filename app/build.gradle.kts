@@ -22,10 +22,17 @@ android {
         applicationId = "io.github.prince_dulb.ohmynotification"
         minSdk = 36
         targetSdk = 36
-        testApplicationId = "io.github.prince_dulb.ohmynotification.test"
+        // A third UID for the emulator-only carrier experiment; never changes the main APK ID.
+        testApplicationId = if (providers.gradleProperty("omnCarrierSourceFixture").orNull == "true") {
+            "io.github.prince_dulb.ohmynotification.sourcefixture"
+        } else {
+            "io.github.prince_dulb.ohmynotification.test"
+        }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 14
-        versionName = "1.1.0-rc1"
+        versionCode = 22
+        versionName = "1.1.0"
+        // Basic logs are always available; extra events/counters require this explicit switch.
+        resValue("bool", "omn_listener_diagnostics", (providers.gradleProperty("omnListenerDiagnostics").orNull == "true").toString())
     }
 
     buildTypes {
@@ -44,6 +51,7 @@ android {
     }
 
     buildFeatures {
+        resValues = true
         buildConfig = false
         compose = true
     }
@@ -57,6 +65,19 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
+}
+
+// Explicit, local emulator fixtures only. Release outputs never use these versions.
+androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+        providers.gradleProperty("omnUpdateFixture").orNull?.let { fixture ->
+            require(fixture in setOf("baseline", "candidate", "signature-baseline")) { "Unknown update fixture" }
+            variant.outputs.forEach { output ->
+                output.versionCode.set(when (fixture) { "baseline" -> 19; "candidate" -> 20; else -> 16 })
+                output.versionName.set(when (fixture) { "baseline" -> "1.1.0"; "candidate" -> "1.1.1"; else -> "1.0.99" })
+            }
         }
     }
 }

@@ -3,6 +3,8 @@ package io.github.prince_dulb.ohmynotification.capture
 import android.app.NotificationManager
 import android.content.Context
 import android.os.SystemClock
+import android.os.Handler
+import android.os.Looper
 import android.service.notification.NotificationListenerService
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -15,6 +17,7 @@ enum class ListenerRebindResult {
     ACCESS_REQUIRED,
     COOLDOWN_OR_AUTOMATIC_LIMIT,
     PLATFORM_REJECTED,
+    IN_PROGRESS,
 }
 
 internal class ListenerRebindController(
@@ -25,12 +28,51 @@ internal class ListenerRebindController(
     private val requestCount = AtomicInteger(0)
     private val lastTrigger = AtomicReference<ListenerRebindTrigger?>(null)
     private val lastResult = AtomicReference<ListenerRebindResult?>(null)
+    private val handler = Handler(Looper.getMainLooper())
+    private val component = OmnNotificationListenerComponent.componentName(context)
+    private val manager = context.getSystemService(NotificationManager::class.java)
+    private val recovery = ListenerRecoveryCoordinator(
+        port = object : ListenerRecoveryPort {
+            override fun accessGranted() = manager.isNotificationListenerAccessGranted(component)
+            override fun connected() = ListenerRuntimeState.isConnected()
+            override fun processingOperational() = ListenerRuntimeState.isProcessingOperational()
+            override fun connectionId() = ListenerRuntimeState.connectionId()
+            override fun requestBind() {
+                ListenerDiagnostics.record(ListenerDiagnosticEvent.BIND_REQUEST)
+                NotificationListenerService.requestRebind(component)
+            }
+            override fun requestUnbind() {
+                ListenerDiagnostics.record(ListenerDiagnosticEvent.UNBIND_REQUEST)
+                NotificationListenerService.requestUnbind(component)
+            }
+        },
+        onTransition = { ListenerDiagnostics.record(ListenerDiagnosticEvent.RECOVERY_STAGE, it.ordinal) },
+        schedule = { delay, action ->
+            val callback = Runnable { action() }
+            handler.postDelayed(callback, delay)
+            val cancel: () -> Unit = { handler.removeCallbacks(callback) }
+            cancel
+        },
+    )
+    val recoveryState = recovery.state
 
+    init { ListenerRuntimeState.addListener { recovery.onHealthChanged() } }
+
+    fun refreshRecoveryState() = recovery.onHealthChanged()
+
+    fun onConnectionEstablished() = gate.onConnectionEstablished()
+
+    @Synchronized
     fun request(trigger: ListenerRebindTrigger): ListenerRebindResult {
-        val result = requestInternal(trigger)
+        val result = try { requestInternal(trigger) }
+        catch (_: RuntimeException) { ListenerRebindResult.PLATFORM_REJECTED }
         requestCount.incrementAndGet()
         lastTrigger.set(trigger)
         lastResult.set(result)
+        ListenerDiagnostics.record(
+            if (trigger == ListenerRebindTrigger.USER) ListenerDiagnosticEvent.USER_REQUEST
+            else ListenerDiagnosticEvent.AUTOMATIC_REQUEST, result.ordinal,
+        )
         return result
     }
 
@@ -41,21 +83,21 @@ internal class ListenerRebindController(
     )
 
     private fun requestInternal(trigger: ListenerRebindTrigger): ListenerRebindResult {
-        if (ListenerRuntimeState.isConnected()) return ListenerRebindResult.ALREADY_CONNECTED
-        val component = OmnNotificationListenerComponent.componentName(context)
-        val notificationManager = context.getSystemService(NotificationManager::class.java)
-        if (!notificationManager.isNotificationListenerAccessGranted(component)) {
+        if (recovery.state.value.running) return ListenerRebindResult.IN_PROGRESS
+        if (ListenerRuntimeState.isConnected() && ListenerRuntimeState.isProcessingOperational()) {
+            return ListenerRebindResult.ALREADY_CONNECTED
+        }
+        if (!manager.isNotificationListenerAccessGranted(component)) {
+            recovery.start()
             return ListenerRebindResult.ACCESS_REQUIRED
         }
         if (!gate.tryAcquire(trigger, elapsedRealtimeMillis())) {
             return ListenerRebindResult.COOLDOWN_OR_AUTOMATIC_LIMIT
         }
-        return try {
-            NotificationListenerService.requestRebind(component)
-            ListenerRebindResult.REQUESTED
-        } catch (_: RuntimeException) {
+        recovery.start()
+        return if (recovery.state.value == ListenerRecoveryState.PLATFORM_REJECTED) {
             ListenerRebindResult.PLATFORM_REJECTED
-        }
+        } else ListenerRebindResult.REQUESTED
     }
 }
 
@@ -78,6 +120,12 @@ internal class ListenerRebindGate(
         require(automaticCooldownMillis >= 0L)
         require(userCooldownMillis >= 0L)
         require(maximumAutomaticRequests >= 0)
+    }
+
+    @Synchronized
+    fun onConnectionEstablished() {
+        automaticRequestCount = 0
+        lastRequestAtElapsedMillis = null
     }
 
     @Synchronized

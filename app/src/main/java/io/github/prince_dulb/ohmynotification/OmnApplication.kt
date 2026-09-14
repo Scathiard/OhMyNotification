@@ -21,22 +21,58 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 class OmnApplication : Application() {
     lateinit var graph: OmnAppGraph
         private set
+    private val ready = MutableStateFlow(false)
+    val storageReady = ready.asStateFlow()
 
     override fun onCreate() {
         super.onCreate()
+        io.github.prince_dulb.ohmynotification.capture.ListenerDiagnostics.initialize(this)
         graph = OmnAppGraph(this)
-        runBlocking {
-            withContext(Dispatchers.IO) { graph.repository.reconcilePolicyFromDatabase() }
+        if (io.github.prince_dulb.ohmynotification.capture.ListenerDiagnostics.enabled) {
+            io.github.prince_dulb.ohmynotification.capture.ListenerRuntimeState.addListener {
+                io.github.prince_dulb.ohmynotification.capture.ListenerDiagnostics.record(
+                    io.github.prince_dulb.ohmynotification.capture.ListenerDiagnosticEvent.HEALTH,
+                )
+            }
         }
+        runBlocking { retryStorage() }
 
+    }
+
+    suspend fun retryStorage(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            graph.repository.reconcilePolicyFromDatabase()
+            ready.value = true
+            io.github.prince_dulb.ohmynotification.capture.ListenerDiagnostics.record(
+                io.github.prince_dulb.ohmynotification.capture.ListenerDiagnosticEvent.STORAGE_READY,
+            )
+            true
+        } catch (cancel: kotlinx.coroutines.CancellationException) {
+            throw cancel
+        } catch (_: Exception) {
+            reportStorageFailure()
+            false
+        }
+    }
+
+    fun reportStorageFailure() {
+        io.github.prince_dulb.ohmynotification.capture.ListenerDiagnostics.record(
+            io.github.prince_dulb.ohmynotification.capture.ListenerDiagnosticEvent.STORAGE_FAILED,
+        )
+        ready.value = false
+        io.github.prince_dulb.ohmynotification.capture.ListenerRuntimeState.recordFailure()
+        io.github.prince_dulb.ohmynotification.capture.ListenerRuntimeState.setProcessingOperational(false)
     }
 }
 
 class OmnAppGraph(application: Application) {
+    init { io.github.prince_dulb.ohmynotification.capture.ListenerRuntimeState.initialize(application) }
     val runtimeSessionId: String = UUID.randomUUID().toString()
     val serialScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
     val policyStore = MonitoringPolicyStore(application.packageName)
@@ -60,6 +96,7 @@ class OmnAppGraph(application: Application) {
         ),
         runtimeActionStore = runtimeActionStore,
         policyStore = policyStore,
+        onStorageFailure = { (application as OmnApplication).reportStorageFailure() },
     )
 
 }

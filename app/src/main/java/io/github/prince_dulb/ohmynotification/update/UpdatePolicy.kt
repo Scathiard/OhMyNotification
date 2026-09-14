@@ -16,14 +16,15 @@ data class ReleaseVersion(val major: Int, val minor: Int, val patch: Int, val ca
 }
 
 internal object UpdatePolicy {
-    const val RELEASES_URL = "https://github.com/prince-dulb/OhMyNotification/releases"
-    const val API_URL = "https://api.github.com/repos/prince-dulb/OhMyNotification/releases/latest"
+    const val RELEASES_URL = "https://github.com/Scathiard/OhMyNotification/releases"
+    const val API_URL = "https://api.github.com/repos/Scathiard/OhMyNotification/releases/latest"
+    private val repositories = setOf("Scathiard/OhMyNotification", "prince-dulb/OhMyNotification")
     const val MAX_APK_BYTES = 200L * 1024 * 1024
 
     fun requireAssetUrl(url: String, tag: String, filename: String) {
         val uri = URI(url)
         require(uri.scheme == "https" && uri.host == "github.com" && uri.port == -1 && uri.userInfo == null)
-        require(uri.rawPath == "/prince-dulb/OhMyNotification/releases/download/$tag/$filename")
+        require(repositories.any { uri.rawPath == "/$it/releases/download/$tag/$filename" })
         require(uri.query == null && uri.fragment == null)
     }
 

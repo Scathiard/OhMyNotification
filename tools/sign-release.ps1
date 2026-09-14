@@ -12,10 +12,20 @@ without deleting its app data.
 
 .EXAMPLE
 .\tools\sign-release.ps1
+
+.EXAMPLE
+.\tools\sign-release.ps1 -BuildArchive -PreflightOnly
+# Read-only input/output checks; never requests a password or creates artifacts.
+
+.EXAMPLE
+.\tools\sign-release.ps1 -BuildArchive -IncludeAndroidTest
+# Preserve earlier builds with the same versionName in separate versionCode directories.
 #>
 param(
     [ValidatePattern('^[0-9A-Za-z][0-9A-Za-z.-]*$')]
     [string]$ArtifactVersion,
+    [switch]$BuildArchive,
+    [switch]$PreflightOnly,
     [switch]$IncludeAndroidTest,
     [switch]$OnlyAndroidTest,
     [string]$ReleaseKeyStore = (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.android\OhMyNotification-release.jks'),
@@ -31,12 +41,18 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $versionConfig = Get-Content -LiteralPath (Join-Path $projectRoot 'app\build.gradle.kts') -Raw -Encoding UTF8
 $versionMatch = [regex]::Match($versionConfig, 'versionName\s*=\s*"([^"]+)"')
 if (-not $versionMatch.Success) { throw 'Could not read the current versionName.' }
+$versionCodeMatch = [regex]::Match($versionConfig, 'versionCode\s*=\s*(\d+)')
+if (-not $versionCodeMatch.Success) { throw 'Could not read the current versionCode.' }
+$versionCode = [int]$versionCodeMatch.Groups[1].Value
 if ([string]::IsNullOrWhiteSpace($ArtifactVersion)) { $ArtifactVersion = $versionMatch.Groups[1].Value }
 if (-not $OnlyAndroidTest -and $ArtifactVersion -ne $versionMatch.Groups[1].Value) {
     throw 'ArtifactVersion must match the application versionName.'
 }
 $unsignedApk = Join-Path $projectRoot 'app\build\outputs\apk\release\app-release-unsigned.apk'
 $artifactsDirectory = Join-Path $projectRoot 'artifacts'
+if ($BuildArchive) {
+    $artifactsDirectory = Join-Path $artifactsDirectory "builds\$ArtifactVersion-code$versionCode"
+}
 $signedApk = Join-Path $artifactsDirectory "OhMyNotification-$ArtifactVersion-release.apk"
 $shaFile = "$signedApk.sha256"
 $debugKeyStore = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.android\debug.keystore'
@@ -53,7 +69,9 @@ if ($IncludeAndroidTest) {
     $testInput = Join-Path $projectRoot 'app\build\outputs\apk\androidTest\debug\app-debug-androidTest.apk'
     $testOutput = Join-Path $artifactsDirectory "OhMyNotification-$ArtifactVersion-androidTest.apk"
     if (-not (Test-Path -LiteralPath $testInput)) { throw 'Build the AndroidTest APK before signing.' }
-    if (Test-Path -LiteralPath $testOutput) { throw 'The signed AndroidTest APK already exists.' }
+    if ((Test-Path -LiteralPath $testOutput) -or (Test-Path -LiteralPath "$testOutput.sha256")) {
+        throw 'The signed AndroidTest APK or checksum already exists.'
+    }
 }
 
 function Resolve-SdkPath {
@@ -73,6 +91,26 @@ function Resolve-SdkPath {
 $apksigner = Join-Path (Resolve-SdkPath) 'build-tools\36.1.0\apksigner.bat'
 if (-not (Test-Path -LiteralPath $apksigner -PathType Leaf)) {
     throw 'Android Build Tools 36.1.0 apksigner was not found.'
+}
+
+$aapt2 = Join-Path (Split-Path -Parent $apksigner) 'aapt2.exe'
+if (-not $OnlyAndroidTest) {
+    $badging = (& $aapt2 dump badging $unsignedApk 2>&1) -join [Environment]::NewLine
+    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the unsigned APK.' }
+    $expectedIdentity = "package: name='io.github.prince_dulb.ohmynotification'.*versionCode='$versionCode'.*versionName='$([regex]::Escape($versionMatch.Groups[1].Value))'"
+    if ($badging -notmatch $expectedIdentity -or $badging -match 'application-debuggable') {
+        throw 'Unsigned APK identity/build type differs from the current source configuration. Rebuild before signing.'
+    }
+}
+if ($IncludeAndroidTest) {
+    $testBadging = (& $aapt2 dump badging $testInput 2>&1) -join [Environment]::NewLine
+    if ($LASTEXITCODE -ne 0 -or $testBadging -notmatch "package: name='io.github.prince_dulb.ohmynotification.test'") {
+        throw 'AndroidTest input has the wrong package identity.'
+    }
+}
+if ($PreflightOnly) {
+    Write-Output "PASS signingPreflight=true versionCode=$versionCode buildArchive=$BuildArchive androidTestOnly=$OnlyAndroidTest"
+    exit 0
 }
 
 $securePassword = Read-Host 'Release key password' -AsSecureString
@@ -154,7 +192,12 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Failed to sign the AndroidTest APK.' }
         & $apksigner verify --verbose --min-sdk-version 36 $testOutput
         if ($LASTEXITCODE -ne 0) { throw 'AndroidTest signature verification failed.' }
-        Write-Output "PASS androidTest=$testOutput"
+        $testStream = [IO.File]::OpenRead($testOutput)
+        $testHasher = [Security.Cryptography.SHA256]::Create()
+        try { $testDigest = ([BitConverter]::ToString($testHasher.ComputeHash($testStream))).Replace('-', '').ToLowerInvariant() }
+        finally { $testStream.Dispose(); $testHasher.Dispose() }
+        [IO.File]::WriteAllText("$testOutput.sha256", "$testDigest  $(Split-Path -Leaf $testOutput)`n", [Text.UTF8Encoding]::new($false))
+        Write-Output "PASS androidTest=$testOutput sha256=$testDigest"
     }
 }
 finally {

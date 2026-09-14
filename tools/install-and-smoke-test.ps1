@@ -11,7 +11,8 @@ Installs the local MVP Debug APK, launches its main activity, and records privat
 #>
 param(
     [string]$ApkPath,
-    [string]$Serial
+    [string]$Serial,
+    [switch]$RequireRelease
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,7 +31,7 @@ if (-not (Test-Path -LiteralPath $ApkPath -PathType Leaf)) {
     throw 'Local delivery APK is missing. Build and copy the documented Debug artifact first.'
 }
 
-$null = & (Join-Path $PSScriptRoot 'verify-installable-apk.ps1') -ApkPath $ApkPath
+$null = & (Join-Path $PSScriptRoot 'verify-installable-apk.ps1') -ApkPath $ApkPath -RequireRelease:$RequireRelease
 
 function Resolve-AdbPath {
     $sdkCandidates = [System.Collections.Generic.List[string]]::new()

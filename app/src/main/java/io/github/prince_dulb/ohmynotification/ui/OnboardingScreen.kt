@@ -1,6 +1,5 @@
 package io.github.prince_dulb.ohmynotification.ui
 
-import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -49,10 +48,11 @@ internal fun OnboardingScreen(
         }
         item {
             GuideStep("3. 电池限制", if (state.batteryUnrestricted) "系统报告：已忽略电池优化" else "尚未忽略电池优化",
-                "在系统列表中找到 OMN，选择不优化或不受限制。厂商额外的后台限制仍需手动确认。", "打开电池优化设置", onBattery)
+                "在系统设置中找到 OMN，检查电池限制；如有“不优化”或“不受限制”等选项，可按需选择。其他后台限制仍需手动确认。", "打开电池优化设置", onBattery)
         }
         item {
-            GuideStep("4. 厂商后台设置", "需要手动确认", manufacturerGuidance(Build.MANUFACTURER, Build.BRAND),
+            GuideStep("4. 后台运行", "需要手动确认",
+                "在系统的应用或电池设置中检查 OMN 的后台运行限制。如有自启动、允许后台运行或最近任务锁定等选项，可按需开启。选项名称和入口因系统而异，OMN 无法自动确认这些设置。没有对应选项也可以跳过。",
                 "打开应用信息", onAppSettings)
         }
         item {
@@ -71,16 +71,5 @@ private fun GuideStep(title: String, status: String, description: String, action
             Text(description, style = MaterialTheme.typography.bodyMedium)
             TextButton(onClick = onClick) { Text(action) }
         }
-    }
-}
-
-internal fun manufacturerGuidance(manufacturer: String, brand: String): String {
-    val identity = "$manufacturer $brand".lowercase(java.util.Locale.ROOT)
-    return when {
-        listOf("vivo", "iqoo").any(identity::contains) ->
-            "vivo / iQOO：在系统设置或 i 管家中允许 OMN 自启动和后台高耗电；在最近任务中锁定 OMN。不同系统版本的入口名称可能不同，这些选项需你手动确认。"
-        listOf("nubia", "redmagic", "zte", "红魔").any(identity::contains) ->
-            "红魔：在应用或电池管理中允许 OMN 自启动、后台运行，放宽后台耗电限制；在最近任务中锁定 OMN。不同系统版本的入口名称可能不同，这些选项需你手动确认。"
-        else -> "在系统的应用、电池或安全管理中找到 OMN，允许自启动和后台运行，并在最近任务中锁定。具体入口由手机厂商决定，OMN 无法自动读取这些设置。"
     }
 }

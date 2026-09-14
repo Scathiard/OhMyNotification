@@ -3,6 +3,13 @@
 
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Fixed synthetic identities only; never request broad package visibility. -->
+    <queries>
+        <package android:name="io.github.prince_dulb.ohmynotification" />
+        <package android:name="io.github.prince_dulb.ohmynotification.sourcefixture" />
+        <package android:name="tv.danmaku.bili" />
+    </queries>
+
     <application
         android:label="OMN Phase 0 Test Source"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
@@ -17,9 +24,35 @@
             android:name="io.github.prince_dulb.ohmynotification.testsource.ControlledTargetJavaActivity"
             android:exported="false"
             android:process=":controlled_target" />
+        <activity-alias
+            android:name="io.github.prince_dulb.ohmynotification.testsource.ControlledRebootTarget"
+            android:targetActivity="io.github.prince_dulb.ohmynotification.testsource.ControlledTargetJavaActivity"
+            android:exported="true" />
         <activity
             android:name="io.github.prince_dulb.ohmynotification.testsource.ControlledTargetActivity"
             android:exported="false" />
+        <service
+            android:name="io.github.prince_dulb.ohmynotification.testsource.SyntheticCarrierService"
+            android:exported="true" />
+        <service
+            android:name="io.github.prince_dulb.ohmynotification.testsource.RouteProbeListener"
+            android:label="OMN 临时只读跳转检查"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+        <provider
+            android:name="io.github.prince_dulb.ohmynotification.testsource.RouteProbeListener$Bridge"
+            android:authorities="${applicationId}.routeprobe"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+        <activity
+            android:name="io.github.prince_dulb.ohmynotification.testsource.RouteReplayProbeActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
     </application>
 
 </manifest>

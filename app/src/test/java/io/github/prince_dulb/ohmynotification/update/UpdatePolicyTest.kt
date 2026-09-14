@@ -4,6 +4,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class UpdatePolicyTest {
+    @Test fun acceptsCanonicalRepositoryAfterOwnerRename() {
+        val name = "OhMyNotification-1.1.0-release.apk"
+        for (suffix in listOf("", ".sha256")) {
+            UpdatePolicy.requireAssetUrl(
+                "https://github.com/Scathiard/OhMyNotification/releases/download/v1.1.0/$name$suffix",
+                "v1.1.0", "$name$suffix",
+            )
+        }
+    }
+
     @Test fun numericVersionsAndFinalAfterRc() {
         assertTrue(ReleaseVersion.parse("1.10.0")!! > ReleaseVersion.parse("1.9.9")!!)
         assertTrue(ReleaseVersion.parse("1.1.0")!! > ReleaseVersion.parse("1.1.0-rc1")!!)
@@ -22,11 +32,14 @@ class UpdatePolicyTest {
     }
 
     @Test fun downloadMustBelongToExactOfficialRelease() {
-        val url = "https://github.com/prince-dulb/OhMyNotification/releases/download/v1.1.0/OMN.apk"
+        for (owner in listOf("prince-dulb", "Scathiard")) {
+        val url = "https://github.com/$owner/OhMyNotification/releases/download/v1.1.0/OMN.apk"
         UpdatePolicy.requireAssetUrl(url, "v1.1.0", "OMN.apk")
         listOf(url.replace("https:", "http:"), url.replace("github.com", "github.com.attacker.test"),
-            url.replace("prince-dulb", "other"), "$url?redirect=1", url.replace("v1.1.0", "v9.0.0")).forEach { bad ->
+            url.replace(owner, "other"), "$url?redirect=1", "$url#fragment", url.replace("v1.1.0", "v9.0.0"),
+            url.replace("OhMyNotification/", "OhMyNotification-other/"), url.replace("OMN.apk", "other.apk")).forEach { bad ->
             assertThrows(IllegalArgumentException::class.java) { UpdatePolicy.requireAssetUrl(bad, "v1.1.0", "OMN.apk") }
+        }
         }
     }
 

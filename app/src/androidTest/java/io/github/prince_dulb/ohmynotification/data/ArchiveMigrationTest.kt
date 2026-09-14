@@ -12,13 +12,17 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class ArchiveMigrationTest {
-    @Test fun realV1SchemaMigratesWithoutChangingAnyLegacyField() {
+    @Test fun realV1SchemaMigratesWithoutChangingAnyLegacyField() = verifyMigration(1)
+
+    @Test fun realV2SchemaMigratesWithoutChangingAnyLegacyField() = verifyMigration(2)
+
+    private fun verifyMigration(fromVersion: Int) {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         val name = "migration-${java.util.UUID.randomUUID()}.db"
         val path = context.getDatabasePath(name).apply { parentFile!!.mkdirs() }
         val schema = JSONObject(instrumentation.context.assets.open(
-            "io.github.prince_dulb.ohmynotification.data.OmnDatabase/1.json",
+            "io.github.prince_dulb.ohmynotification.data.OmnDatabase/$fromVersion.json",
         ).bufferedReader().use { it.readText() }).getJSONObject("database")
         val expected = linkedMapOf<String, List<List<String?>>>()
         SQLiteDatabase.openOrCreateDatabase(path, null).use { old ->
@@ -44,21 +48,32 @@ class ArchiveMigrationTest {
                     expected[table] = buildList { while (cursor.moveToNext()) add((0 until cursor.columnCount).map(cursor::getString)) }
                 }
             }
-            old.version = 1
+            old.version = fromVersion
         }
         val database = Room.databaseBuilder(context, OmnDatabase::class.java, name)
-            .addMigrations(OmnDatabase.MIGRATION_1_2).build()
+            .addMigrations(OmnDatabase.MIGRATION_1_2, OmnDatabase.MIGRATION_2_3).build()
         try {
             val upgraded = database.openHelper.writableDatabase
-            assertEquals(2, upgraded.version)
+            assertEquals(3, upgraded.version)
             expected.forEach { (table, rows) ->
                 upgraded.query("SELECT * FROM `$table` ORDER BY rowid").use { cursor ->
-                    val actual = buildList { while (cursor.moveToNext()) add((0 until cursor.columnCount).map(cursor::getString)) }
+                    val originalColumnCount = rows.first().size
+                    val actual = buildList { while (cursor.moveToNext()) add((0 until originalColumnCount).map(cursor::getString)) }
                     assertEquals(table, rows, actual)
                 }
             }
             upgraded.query("SELECT COUNT(*) FROM manual_archives").use { cursor ->
-                assertTrue(cursor.moveToFirst()); assertEquals(0, cursor.getInt(0))
+                assertTrue(cursor.moveToFirst()); assertEquals(if (fromVersion == 1) 0 else 2, cursor.getInt(0))
+            }
+            listOf("notification_revisions", "notification_targets").forEach { table ->
+                upgraded.query("SELECT COUNT(*) FROM `$table`").use { cursor ->
+                    assertTrue(cursor.moveToFirst()); assertEquals(0, cursor.getInt(0))
+                }
+            }
+            upgraded.query("SELECT lastListenerConnectionId, lastObservedPostTimeEpochMillis, identityUncertain FROM notification_items").use { cursor ->
+                while (cursor.moveToNext()) {
+                    assertTrue(cursor.isNull(0)); assertTrue(cursor.isNull(1)); assertEquals(0, cursor.getInt(2))
+                }
             }
         } finally { database.close(); context.deleteDatabase(name) }
     }

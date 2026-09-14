@@ -13,6 +13,33 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface OmnDao {
+    @Query("SELECT * FROM notification_items WHERE itemId = :itemId")
+    fun observeItem(itemId: Long): Flow<NotificationItemEntity?>
+
+    @Query("SELECT COALESCE(MAX(itemId), 0) FROM notification_items")
+    suspend fun maximumItemId(): Long
+
+    @Insert
+    suspend fun insertRevision(revision: NotificationRevisionEntity)
+
+    @Query("SELECT * FROM notification_revisions WHERE itemId = :itemId ORDER BY revisionId DESC")
+    fun observeRevisions(itemId: Long): Flow<List<NotificationRevisionEntity>>
+
+    @Query("SELECT * FROM notification_revisions WHERE itemId = :itemId ORDER BY revisionId DESC")
+    fun pageRevisions(itemId: Long): PagingSource<Int, NotificationRevisionEntity>
+
+    @Query("DELETE FROM notification_revisions WHERE itemId IN (:ids)")
+    suspend fun deleteRevisions(ids: List<Long>)
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertTarget(target: NotificationTargetEntity)
+
+    @Query("SELECT * FROM notification_targets WHERE itemId = :itemId")
+    suspend fun target(itemId: Long): NotificationTargetEntity?
+
+    @Query("DELETE FROM notification_targets WHERE itemId IN (:ids)")
+    suspend fun deleteTargets(ids: List<Long>)
+
     @Query(
         """
         SELECT * FROM notification_items

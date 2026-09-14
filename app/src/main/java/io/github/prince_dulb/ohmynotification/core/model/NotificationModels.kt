@@ -33,6 +33,7 @@ enum class SnapshotCopyWarning {
     SUB_TEXT_COPY_FAILED,
     SUMMARY_TEXT_COPY_FAILED,
     INFO_TEXT_COPY_FAILED,
+    CAPTURE_TEXT_TRUNCATED,
 }
 
 data class ActionCapabilitySet(

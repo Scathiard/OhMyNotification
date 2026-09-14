@@ -13,16 +13,10 @@ enum class RuntimeActionStatus {
     SECURITY_REJECTED,
 }
 
-class RuntimeActionStore(private val maxHandles: Int = 512) {
-    init {
-        require(maxHandles > 0)
-    }
-
-    private val handles = object : LinkedHashMap<Long, PendingIntent>(maxHandles + 1, 0.75f, true) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<Long, PendingIntent>?,
-        ): Boolean = size > maxHandles
-    }
+class RuntimeActionStore {
+    // These are live capabilities, not disposable UI cache entries. Do not silently evict them.
+    // Only tiny ID/token references are held here; notification text remains paged in Room.
+    private val handles = LinkedHashMap<Long, PendingIntent>()
     private val currentItemIds = MutableStateFlow<Set<Long>>(emptySet())
 
     val itemIds: StateFlow<Set<Long>> = currentItemIds.asStateFlow()
@@ -30,8 +24,9 @@ class RuntimeActionStore(private val maxHandles: Int = 512) {
     @Synchronized
     fun put(itemId: Long, action: PendingIntent?) {
         require(itemId > 0L)
+        val previouslyPresent = itemId in handles
         if (action == null) handles.remove(itemId) else handles[itemId] = action
-        publishItemIds()
+        if (previouslyPresent != (action != null)) publishItemIds()
     }
 
     @Synchronized
@@ -62,8 +57,7 @@ class RuntimeActionStore(private val maxHandles: Int = 512) {
             publishItemIds()
             RuntimeActionStatus.CANCELED
         } catch (_: SecurityException) {
-            handles.remove(itemId)
-            publishItemIds()
+            // A permission or foreground restriction can be temporary. Keep the capability.
             RuntimeActionStatus.SECURITY_REJECTED
         }
     }

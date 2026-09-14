@@ -22,6 +22,16 @@ import org.json.JSONObject
 
 class MvpDatabaseStatsReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == "io.github.prince_dulb.ohmynotification.debug.RECOVER_LISTENER") {
+            val graph = (context.applicationContext as OmnApplication).graph
+            val result = graph.listenerRebindController.request(
+                io.github.prince_dulb.ohmynotification.capture.ListenerRebindTrigger.USER,
+            )
+            resultCode = Activity.RESULT_OK
+            resultData = JSONObject().put("result", result.name)
+                .put("recovery", graph.listenerRebindController.recoveryState.value.name).toString()
+            return
+        }
         if (intent.action == ACTION_UNBIND_PRODUCTION_LISTENER) {
             NotificationListenerService.requestUnbind(
                 OmnNotificationListenerComponent.componentName(context),
@@ -85,6 +95,9 @@ class MvpDatabaseStatsReceiver : BroadcastReceiver() {
         return JSONObject()
             .put("status", "OK")
             .put("listenerConnected", ListenerRuntimeState.isConnected())
+            .put("listenerProcessingOperational", ListenerRuntimeState.isProcessingOperational())
+            .put("listenerRecoveryState", graph.listenerRebindController.recoveryState.value.name)
+            .put("listenerDiagnosticCounters", JSONObject(io.github.prince_dulb.ohmynotification.capture.ListenerDiagnostics.counterSnapshot()))
             .put("listenerRebindRequestCount", rebind.requestCount)
             .put("listenerRebindLastTrigger", rebind.lastTrigger?.name)
             .put("listenerRebindLastResult", rebind.lastResult?.name)
@@ -140,6 +153,10 @@ class MvpDatabaseStatsReceiver : BroadcastReceiver() {
             )
             .put("runtimeActionHandleCount", graph.runtimeActionStore.size())
             .put("notificationItemCount", database.scalar("SELECT COUNT(*) FROM notification_items"))
+            .put("controlledLatestPostTime", database.scalar(
+                "SELECT COALESCE(MAX(lastObservedPostTimeEpochMillis), 0) FROM notification_items WHERE sourcePackage = ?",
+                arrayOf(CONTROLLED_SOURCE_PACKAGE),
+            ))
             .put(
                 "duplicateIdentityGenerationGroups",
                 database.scalar(

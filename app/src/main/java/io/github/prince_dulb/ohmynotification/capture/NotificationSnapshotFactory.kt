@@ -50,7 +50,7 @@ class NotificationSnapshotFactory(
         if (sourcePackage == ownPackageName) {
             return SnapshotResult.Excluded(ExclusionReason.SELF_PACKAGE)
         }
-        if (policy.excludes(sourcePackage)) {
+        if (callbackKind != ObservedCallbackKind.REMOVED && policy.excludes(sourcePackage)) {
             return SnapshotResult.Excluded(ExclusionReason.USER_POLICY)
         }
 
@@ -66,7 +66,7 @@ class NotificationSnapshotFactory(
                 }.getOrDefault(false),
             ),
         )
-        if (!policy.records(notificationType)) {
+        if (callbackKind != ObservedCallbackKind.REMOVED && !policy.records(notificationType)) {
             return SnapshotResult.Excluded(ExclusionReason.TYPE_POLICY)
         }
 
@@ -102,7 +102,8 @@ class NotificationSnapshotFactory(
         val content = RawVisibleContent(
             title = copyText(extras, Notification.EXTRA_TITLE, SnapshotCopyWarning.TITLE_COPY_FAILED, warnings),
             text = copyText(extras, Notification.EXTRA_TEXT, SnapshotCopyWarning.TEXT_COPY_FAILED, warnings),
-            bigText = copyText(extras, Notification.EXTRA_BIG_TEXT, SnapshotCopyWarning.BIG_TEXT_COPY_FAILED, warnings),
+            bigText = copyStandardStyle(extras, warnings)
+                ?: copyText(extras, Notification.EXTRA_BIG_TEXT, SnapshotCopyWarning.BIG_TEXT_COPY_FAILED, warnings),
             subText = copyText(extras, Notification.EXTRA_SUB_TEXT, SnapshotCopyWarning.SUB_TEXT_COPY_FAILED, warnings),
             summaryText = copyText(
                 extras,
@@ -146,9 +147,45 @@ class NotificationSnapshotFactory(
         warning: SnapshotCopyWarning,
         warnings: MutableSet<SnapshotCopyWarning>,
     ): String? = try {
-        extras.getCharSequence(key)?.toString()
+        extras.getCharSequence(key)?.let { boundedText(it, warnings, if (key == Notification.EXTRA_TITLE) 4_096 else 32_768) }
     } catch (_: RuntimeException) {
         warnings += warning
+        null
+    }
+
+    private fun boundedText(text: CharSequence, warnings: MutableSet<SnapshotCopyWarning>, limit: Int = 32_768): String {
+        var end = minOf(text.length, limit)
+        if (end < text.length) {
+            warnings += SnapshotCopyWarning.CAPTURE_TEXT_TRUNCATED
+            if (end > 0 && Character.isHighSurrogate(text[end - 1])) end--
+        }
+        return text.subSequence(0, end).toString()
+    }
+
+    private fun copyStandardStyle(extras: Bundle, warnings: MutableSet<SnapshotCopyWarning>): String? = try {
+        val messageBundles = extras.getParcelableArray(Notification.EXTRA_MESSAGES, android.os.Parcelable::class.java)
+        val lines: Sequence<CharSequence> = if (!messageBundles.isNullOrEmpty()) {
+            if (messageBundles.size > 100) warnings += SnapshotCopyWarning.CAPTURE_TEXT_TRUNCATED
+            Notification.MessagingStyle.Message.getMessagesFromBundleArray(messageBundles.takeLast(100).toTypedArray())
+                .asSequence().map { message ->
+                    val text = boundedText(message.text ?: "", warnings)
+                    val sender = message.senderPerson?.name?.let { boundedText(it, warnings, 256) }
+                    if (sender.isNullOrBlank()) text else "$sender: $text"
+                }
+        } else {
+            val textLines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
+            if (textLines != null && textLines.size > 100) warnings += SnapshotCopyWarning.CAPTURE_TEXT_TRUNCATED
+            textLines?.takeLast(100)?.asSequence() ?: emptySequence()
+        }
+        val output = StringBuilder()
+        for (line in lines) {
+            if (output.length >= 32_768) { warnings += SnapshotCopyWarning.CAPTURE_TEXT_TRUNCATED; break }
+            if (output.isNotEmpty()) output.append('\n')
+            output.append(boundedText(line, warnings, (32_768 - output.length).coerceAtLeast(0)))
+        }
+        output.toString().takeIf { it.isNotBlank() }
+    } catch (_: RuntimeException) {
+        warnings += SnapshotCopyWarning.BIG_TEXT_COPY_FAILED
         null
     }
 

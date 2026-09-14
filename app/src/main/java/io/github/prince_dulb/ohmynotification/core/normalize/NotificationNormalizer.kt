@@ -23,6 +23,7 @@ enum class NormalizationWarning {
     BODY_TRUNCATED,
     SOURCE_LABEL_TRUNCATED,
     SOURCE_TEXT_COPY_FAILED,
+    CAPTURE_SIZE_LIMIT,
     UNSAFE_CONTROL_REPLACED,
     POST_TIME_REJECTED,
 }
@@ -83,8 +84,11 @@ class NotificationNormalizer(
         }
 
         val warnings = linkedSetOf<NormalizationWarning>()
-        if (observation.copyWarnings.isNotEmpty()) {
+        if (observation.copyWarnings.any { it != io.github.prince_dulb.ohmynotification.core.model.SnapshotCopyWarning.CAPTURE_TEXT_TRUNCATED }) {
             warnings += NormalizationWarning.SOURCE_TEXT_COPY_FAILED
+        }
+        if (io.github.prince_dulb.ohmynotification.core.model.SnapshotCopyWarning.CAPTURE_TEXT_TRUNCATED in observation.copyWarnings) {
+            warnings += NormalizationWarning.CAPTURE_SIZE_LIMIT
         }
 
         val titleResult = normalizeText(observation.content.title, limits.maxTitleCodePoints)

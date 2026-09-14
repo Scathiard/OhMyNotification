@@ -15,7 +15,6 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -33,12 +32,13 @@ import kotlinx.coroutines.launch
 @Composable
 internal fun SettingsScreen(
     settings: AppSettingsSnapshot,
-    snackbarHostState: SnackbarHostState,
+    snackbarHostState: SnackbarFeedback,
     onBack: () -> Unit,
     unavailableArchiveCount: Long,
     onOpenUnavailableArchive: () -> Unit,
     onManageExcludedApps: () -> Unit,
     onOpenOnboarding: () -> Unit,
+    onExportDiagnostics: () -> Unit,
     updateContent: @Composable () -> Unit,
     onSetNotificationTypeRecorded: suspend (NotificationType, Boolean) -> Boolean,
     onSetGroupingWindowMinutes: suspend (Int) -> Boolean,
@@ -69,6 +69,22 @@ internal fun SettingsScreen(
             }
             item(key = "updates") { updateContent() }
 
+            item(key = "diagnostics") {
+                SettingsCard(
+                    title = "故障排查",
+                    supportingText = "仅保留最近的关键运行状态，不记录通知正文或跳转链接。日志保存在本机，不会自动上传。",
+                ) {
+                    OutlinedButton(onClick = onExportDiagnostics, modifier = Modifier.fillMaxWidth()) {
+                        Text("导出监听诊断日志")
+                    }
+                    Text(
+                        "遇到问题时，请附上日志前往 GitHub 提交 Issue。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
             item(key = "notification-types") {
                 SettingsCard(
                     title = "记录哪些通知",
@@ -83,7 +99,7 @@ internal fun SettingsScreen(
                             onCheckedChange = { checked ->
                                 coroutineScope.launch {
                                     if (!onSetNotificationTypeRecorded(type, checked)) {
-                                        snackbarHostState.showSnackbar("未能保存通知类型设置")
+                                        snackbarHostState.showLatestSnackbar("未能保存通知类型设置")
                                     }
                                 }
                             },
@@ -122,7 +138,7 @@ internal fun SettingsScreen(
                                     onClick = {
                                         coroutineScope.launch {
                                             if (!onSetGroupingWindowMinutes(minutes)) {
-                                                snackbarHostState.showSnackbar("未能保存合并时间间隔")
+                                                snackbarHostState.showLatestSnackbar("未能保存合并时间间隔")
                                             }
                                         }
                                     },
@@ -150,7 +166,7 @@ internal fun SettingsScreen(
             }
         }
         SnackbarHost(
-            hostState = snackbarHostState,
+            hostState = snackbarHostState.hostState,
             modifier = Modifier.align(Alignment.BottomCenter).safeDrawingPadding(),
         )
     }
