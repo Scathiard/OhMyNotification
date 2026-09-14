@@ -16,7 +16,7 @@
 
 [下载最新正式版](https://github.com/Scathiard/OhMyNotification/releases/latest)
 
-当前版本：`v1.1.0`　·　系统要求：**目前仅支持 Android 16 及以上**
+当前版本：`v1.1.0` · 系统要求：**目前仅支持 Android 16 及以上**
 
 ## 能做什么
 
